@@ -10,6 +10,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import At, Plain
 from astrbot.api.star import Context, Star
+from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from astrbot.core.utils.session_waiter import SessionController, SessionFilter, session_waiter
 
@@ -25,7 +26,6 @@ from .szu_electricity.storage import Store
 
 COMMANDS = {"绑定宿舍", "导出宿舍", "用电", "解绑宿舍", "发送低电量预警"}
 MENTION_PLATFORMS = {"aiocqhttp", "telegram", "discord", "slack", "lark", "dingtalk"}
-NO_PROACTIVE = {"qq_official", "webchat"}
 
 
 class SenderSessionFilter(SessionFilter):
@@ -174,7 +174,8 @@ class SzuHelperPlugin(Star):
             location,
         )
         text = f"已绑定：{location.buildingName} {location.roomName}。可发送 /用电 查询。"
-        if event.get_platform_name() in NO_PROACTIVE:
+        platform = self.context.get_platform_inst(event.get_platform_id())
+        if platform is not None and not getattr(platform.meta(), "support_proactive_message", True):
             text += "\n当前平台不支持定时主动推送，仍可使用查询命令。"
         await self._reply(event, text)
 
@@ -321,10 +322,31 @@ class SzuHelperPlugin(Star):
         await self._guard(event, work)
 
     async def _notify(self, bindings: list[Binding], report: Report) -> bool:
-        platform = bindings[0].platform_name
-        if platform in NO_PROACTIVE:
-            logger.warning(f"SZU 无法主动推送：平台 {platform} 不支持主动消息。")
-            return False
+        adapter = self.context.get_platform_inst(bindings[0].platform_id)
+        if adapter is None:
+            raise ElectricityError("绑定的平台实例已不可用，请在目标会话重新绑定宿舍。")
+        metadata = adapter.meta()
+        platform = metadata.name
+        if not getattr(metadata, "support_proactive_message", True):
+            raise ElectricityError(
+                f"当前 {platform} 适配器声明不支持主动消息，请检查 AstrBot 版本及平台配置。"
+            )
+        if platform == "qq_official" and bindings[0].is_group:
+            # AstrBot 4.28 can silently skip a group/channel whose in-memory
+            # delivery context was lost. Do not record that skip as success.
+            scenes = getattr(adapter, "_session_scene", None)
+            messages = getattr(adapter, "_session_last_message_id", None)
+            if isinstance(scenes, dict) and isinstance(messages, dict):
+                session_id = MessageSession.from_str(bindings[0].origin).session_id.rsplit("_", 1)[
+                    -1
+                ]
+                proactive_group = scenes.get(session_id) == "group" and getattr(
+                    adapter, "_allow_group_proactive_send", False
+                )
+                if not messages.get(session_id) and not proactive_group:
+                    raise ElectricityError(
+                        "QQ 官方机器人的目标会话上下文缺失，请先在该群或频道给机器人发送一条消息后重试。"
+                    )
         chain = []
         for binding in bindings:
             chain.extend(
@@ -337,5 +359,5 @@ class SzuHelperPlugin(Star):
         )
         sent = await self.context.send_message(bindings[0].origin, MessageChain(chain))
         if not sent:
-            logger.warning("SZU 低电量提醒未发送：找不到对应的平台实例。")
+            raise ElectricityError("主动发送时未找到目标平台实例，请检查机器人连接状态。")
         return bool(sent)

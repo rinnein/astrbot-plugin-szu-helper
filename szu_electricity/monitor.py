@@ -1,7 +1,7 @@
 import asyncio
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .models import DEFAULT_LOW_POWER_THRESHOLD, Binding, ElectricityError, Report
 from .storage import Store
@@ -15,14 +15,20 @@ class CheckSummary:
     send_failures: int = 0
     query_failures: int = 0
     stale_dorms: int = 0
+    send_errors: list[str] = field(default_factory=list)
 
     def message(self) -> str:
-        return (
+        summary = (
             f"手动预警检查完成：检查 {self.checked_dorms} 间宿舍，"
             f"其中 {self.low_dorms} 间低于阈值；已发送 {self.sent_messages} 条预警。\n"
             f"查询失败 {self.query_failures} 间，读数过期或缺失 {self.stale_dorms} 间，"
             f"发送失败 {self.send_failures} 条。定时安排及自动预警记录未变更。"
         )
+        if self.send_errors:
+            summary += "\n未发出原因：\n" + "\n".join(
+                f"- {reason}" for reason in dict.fromkeys(self.send_errors)
+            )
+        return summary
 
 
 class Monitor:
@@ -67,7 +73,9 @@ class Monitor:
                 **{
                     field: sum(getattr(result, field) for result in results)
                     for field in CheckSummary.__dataclass_fields__
-                }
+                    if field != "send_errors"
+                },
+                send_errors=[reason for result in results for reason in result.send_errors],
             )
         finally:
             self._running.difference_update(tasks)
@@ -101,9 +109,20 @@ class Monitor:
                     sent = await self.store.deliver(report.location.key, episode, origin, ids, send)
                     result.sent_messages += int(sent is True)
                     result.send_failures += int(sent is False)
+                    if sent is False:
+                        result.send_errors.append("平台发送接口返回失败，未记录为已提醒。")
                 except Exception as exc:
                     result.send_failures += 1
-                    self.logger.warning(f"SZU 低电量提醒发送失败：{type(exc).__name__}")
+                    if isinstance(exc, ElectricityError):
+                        reason = str(exc)
+                    elif isinstance(exc, TimeoutError):
+                        reason = "主动消息发送超时，请检查机器人连接。"
+                    elif isinstance(exc, NotImplementedError):
+                        reason = "当前平台适配器未实现主动发送，请检查 AstrBot 版本。"
+                    else:
+                        reason = f"平台发送接口抛出 {type(exc).__name__}，请查看机器人平台日志。"
+                    result.send_errors.append(reason)
+                    self.logger.warning(f"SZU 低电量提醒发送失败：{reason}")
         except Exception as exc:
             result.query_failures = 1
             self.logger.warning(f"SZU 宿舍检测失败：{type(exc).__name__}")

@@ -25,12 +25,21 @@ plugin_module = importlib.import_module("szu_integration_plugin.main")
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.platform import AstrBotMessage, MessageMember, MessageType, PlatformMetadata
-from astrbot.builtin_stars.session_controller.main import Main as SessionAgent
+
+try:
+    from astrbot.builtin_stars.session_controller.main import Main as SessionAgent
+except ModuleNotFoundError:
+    from astrbot.builtin_stars.astrbot.main import Main as SessionAgent
 from astrbot.core.utils.session_waiter import USER_SESSIONS
 
 from szu_electricity.analytics import summarize
 from szu_electricity.models import SHANGHAI, Binding, ProviderResult, Window
 from szu_electricity.sharing import encode
+
+
+def platform_stub(platform_id, name="aiocqhttp", proactive=True):
+    metadata = PlatformMetadata(name, "Test", id=platform_id, support_proactive_message=proactive)
+    return SimpleNamespace(meta=lambda: metadata)
 
 
 class Event(AstrMessageEvent):
@@ -59,7 +68,7 @@ async def plugin(tmp_path, monkeypatch, catalog):
     config = AstrBotConfig(
         str(tmp_path / "config.json"), schema=json.loads((root / "_conf_schema.json").read_text())
     )
-    context = SimpleNamespace()
+    context = SimpleNamespace(get_platform_inst=platform_stub)
     p = plugin_module.SzuHelperPlugin(context, config)
     await p.initialize()
 
@@ -184,7 +193,11 @@ async def test_message_mentions_and_unsupported_platform(plugin, location):
     assert "低于 7.5 度" in sent[0][1].chain[-1].text
     from dataclasses import replace
 
-    assert not await plugin._notify([replace(binding, platform_name="qq_official")], report)
+    plugin.context.get_platform_inst = lambda platform_id: platform_stub(
+        platform_id, "qq_official", False
+    )
+    with pytest.raises(plugin_module.ElectricityError, match="适配器声明不支持"):
+        await plugin._notify([replace(binding, platform_name="qq_official")], report)
     assert len(sent) == 1
 
 
@@ -347,7 +360,7 @@ async def test_all_network_features_follow_selected_source(tmp_path, monkeypatch
         sent.append((origin, chain))
         return True
 
-    context = SimpleNamespace(send_message=send)
+    context = SimpleNamespace(send_message=send, get_platform_inst=platform_stub)
     plugin = plugin_module.SzuHelperPlugin(context, config)
     await plugin.initialize()
     try:
@@ -653,3 +666,112 @@ async def test_private_reply_has_no_group_mention(plugin):
     await plugin.electricity(event)
     assert mentioned_ids(event.sent[0]) == []
     assert "尚未绑定" in event.output()
+
+
+async def test_qqofficial_428_real_adapter_sends_group_and_private_alerts(
+    plugin, location, monkeypatch
+):
+    from datetime import datetime
+
+    from astrbot.api.star import Context
+    from astrbot.core.platform.sources.qqofficial.qqofficial_platform_adapter import (
+        QQOfficialPlatformAdapter,
+    )
+
+    if not hasattr(QQOfficialPlatformAdapter, "_send_by_session_common"):
+        pytest.skip("This real-adapter test requires AstrBot 4.28.2 or newer")
+    monkeypatch.setenv("ASTRBOT_DISABLE_METRICS", "1")
+    calls = []
+
+    class QQAPI:
+        async def post_group_message(self, **payload):
+            calls.append(("group", payload))
+            return {"id": f"group-message-{len(calls)}"}
+
+    class QQHTTP:
+        async def request(self, route, *, json):
+            calls.append(("private", json))
+            return {"id": f"private-message-{len(calls)}"}
+
+    api = QQAPI()
+    api._http = QQHTTP()
+    adapter = object.__new__(QQOfficialPlatformAdapter)
+    adapter.config = {"id": "qq-main"}
+    adapter.client = SimpleNamespace(api=api)
+    adapter.use_markdown_default = False
+    adapter._session_last_message_id = {}
+    adapter._session_scene = {"group-openid": "group"}
+    adapter._allow_group_proactive_send = True
+    context = object.__new__(Context)
+    context.platform_manager = SimpleNamespace(platform_insts=[adapter])
+    context.astrbot_config_mgr = SimpleNamespace(get_conf=lambda _: {})
+    plugin.context = context
+    assert adapter.meta().support_proactive_message is True
+    for user, origin, is_group in [
+        ("member-one", "qq-main:GroupMessage:group-openid", True),
+        ("member-two", "qq-main:GroupMessage:group-openid", True),
+        ("user-openid", "qq-main:FriendMessage:user-openid", False),
+    ]:
+        await plugin.store.bind("qq-main", origin, user, user, is_group, "qq_official", location)
+
+    async def query(location, detail=False):
+        return summarize(
+            location, "official", Window.for_days(3), ProviderResult([], 4, datetime.now(SHANGHAI))
+        )
+
+    plugin.service.query = query
+    result = await plugin.monitor.run_manual()
+    assert result.checked_dorms == result.low_dorms == 1
+    assert result.sent_messages == 2 and result.send_failures == 0
+    assert result.send_errors == []
+    assert [kind for kind, _ in calls] == ["group", "private"]
+    assert calls[0][1]["group_openid"] == "group-openid"
+    assert "msg_id" not in calls[0][1]  # true proactive group send, no cached incoming message
+    assert all("低于 5 度" in payload["content"] for _, payload in calls)
+    assert await plugin.store._all("SELECT * FROM deliveries") == []
+    await plugin.monitor.run()
+    assert len(calls) == 4
+    assert len(await plugin.store._all("SELECT * FROM deliveries")) == 3
+
+
+async def test_qqofficial_missing_context_is_not_reported_as_sent(plugin, location):
+    from datetime import datetime
+
+    adapter = platform_stub("testbot", "qq_official", True)
+    adapter._session_scene = {}
+    adapter._session_last_message_id = {}
+    adapter._allow_group_proactive_send = True
+    plugin.context.get_platform_inst = lambda _: adapter
+
+    async def must_not_send(*args):
+        raise AssertionError("Missing QQ delivery context must not be counted as successful")
+
+    plugin.context.send_message = must_not_send
+    await bind_in_session(plugin, location, group="group1")
+
+    async def query(location, detail=False):
+        return summarize(
+            location, "official", Window.for_days(3), ProviderResult([], 4, datetime.now(SHANGHAI))
+        )
+
+    plugin.service.query = query
+    result = await plugin.monitor.run_manual()
+    assert result.low_dorms == 1 and result.sent_messages == 0 and result.send_failures == 1
+    assert "目标会话上下文缺失" in result.message()
+    assert await plugin.store._all("SELECT * FROM deliveries") == []
+
+
+async def test_missing_delivery_platform_is_explained(plugin, location):
+    from datetime import datetime
+
+    plugin.context.get_platform_inst = lambda _: None
+    await bind_in_session(plugin, location)
+
+    async def query(location, detail=False):
+        return summarize(
+            location, "official", Window.for_days(3), ProviderResult([], 4, datetime.now(SHANGHAI))
+        )
+
+    plugin.service.query = query
+    result = await plugin.monitor.run_manual()
+    assert result.send_failures == 1 and "平台实例已不可用" in result.message()
