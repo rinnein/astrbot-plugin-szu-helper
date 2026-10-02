@@ -4,9 +4,20 @@ from dataclasses import replace
 from datetime import datetime
 
 from szu_electricity.analytics import summarize
-from szu_electricity.models import SHANGHAI, ProviderResult, Window
+from szu_electricity.models import CACHE_TTL_SECONDS, SHANGHAI, ProviderResult, Window
 from szu_electricity.monitor import Monitor
 from szu_electricity.service import ElectricityService
+
+
+class Clock:
+    def __init__(self):
+        self.now = 1_800_000_000.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds=CACHE_TTL_SECONDS):
+        self.now += seconds
 
 
 class Provider:
@@ -35,7 +46,8 @@ async def bind(store, location, user="1", origin="group1"):
 
 async def test_coalesce_episodes_restart_new_binding(store, location):
     provider = Provider()
-    service = ElectricityService(provider, store)
+    clock = Clock()
+    service = ElectricityService(provider, store, clock=clock)
     await bind(store, location)
     await bind(store, location, "2")
     await bind(store, location, "3", "group2")
@@ -59,8 +71,10 @@ async def test_coalesce_episodes_restart_new_binding(store, location):
     await bind(store, location, "4")
     await monitor.run()
     assert sent[-1] == ["4"]
+    clock.advance()
     provider.remaining = 5
     await monitor.run()
+    clock.advance()
     provider.remaining = 4.99
     await monitor.run()
     assert sent[-2:] == [["1", "2", "4"], ["3"]]
@@ -69,7 +83,8 @@ async def test_coalesce_episodes_restart_new_binding(store, location):
 
 async def test_failure_stale_and_binding_race(store, location):
     provider = Provider()
-    service = ElectricityService(provider, store)
+    clock = Clock()
+    service = ElectricityService(provider, store, clock=clock)
     await bind(store, location)
     calls = []
 
@@ -81,9 +96,11 @@ async def test_failure_stale_and_binding_race(store, location):
     await monitor.run()
     await monitor.run()
     assert len(calls) == 2  # failed sends were not recorded
+    clock.advance()
     provider.expired = True
     await monitor.run()
     assert len(calls) == 2
+    clock.advance()
     provider.expired = False
 
     async def unbind():
@@ -110,7 +127,8 @@ async def test_cross_session_identity_and_older_data(store, location):
 
 async def test_singleflight_cancellation_and_limit(store, location):
     provider = Provider()
-    service = ElectricityService(provider, store)
+    clock = Clock()
+    service = ElectricityService(provider, store, clock=clock)
     entered = asyncio.Event()
     release = asyncio.Event()
 
@@ -144,7 +162,8 @@ async def test_singleflight_cancellation_and_limit(store, location):
 
 async def test_custom_threshold_boundary_and_changes(store, location):
     provider = Provider()
-    service = ElectricityService(provider, store)
+    clock = Clock()
+    service = ElectricityService(provider, store, clock=clock)
     await bind(store, location)
     sent = []
 
@@ -153,9 +172,11 @@ async def test_custom_threshold_boundary_and_changes(store, location):
         return True
 
     monitor = Monitor(store, service, send, logging.getLogger(), threshold=7.5)
+    clock.advance()
     provider.remaining = 7.5
     await monitor.run()
     assert sent == []
+    clock.advance()
     provider.remaining = 7.49
     await monitor.run()
     await monitor.run()
@@ -167,11 +188,14 @@ async def test_custom_threshold_boundary_and_changes(store, location):
     # Lowering the threshold makes this fresh reading healthy and rearms alerts.
     monitor = Monitor(store, service, send, logging.getLogger(), threshold=7)
     await monitor.run()
+    clock.advance()
     provider.remaining = 6.99
     await monitor.run()
     assert sent == [7.49, 6.99]
+    clock.advance()
     provider.remaining = 7
     await monitor.run()
+    clock.advance()
     provider.remaining = 6.99
     await monitor.run()
     assert sent == [7.49, 6.99, 6.99]
@@ -190,7 +214,8 @@ async def automatic_records(store):
 
 async def test_manual_ignores_and_preserves_automatic_records(store, location):
     provider = Provider()
-    service = ElectricityService(provider, store)
+    clock = Clock()
+    service = ElectricityService(provider, store, clock=clock)
     for sender, origin in [("1", "group1"), ("2", "group1"), ("3", "group2")]:
         await bind(store, location, sender, origin)
     sent = []
@@ -205,7 +230,7 @@ async def test_manual_ignores_and_preserves_automatic_records(store, location):
     for _ in range(2):
         prior_calls = provider.calls
         result = await monitor.run_manual()
-        assert provider.calls == prior_calls + 1
+        assert provider.calls == prior_calls  # manual sends reuse the 2 h result cache
         assert result.checked_dorms == result.low_dorms == 1
         assert result.sent_messages == 2 and result.send_failures == 0
         assert sent[-2:] == [["1", "2"], ["3"]]
@@ -214,6 +239,7 @@ async def test_manual_ignores_and_preserves_automatic_records(store, location):
     await monitor.run()
     assert len(sent) == count
     before = await automatic_records(store)
+    clock.advance()
     provider.remaining = 20
     assert (await monitor.run_manual()).low_dorms == 0
     assert await automatic_records(store) == before  # even recovery is not recorded
@@ -222,7 +248,8 @@ async def test_manual_ignores_and_preserves_automatic_records(store, location):
 
 async def test_manual_does_not_consume_first_scheduled_warning(store, location):
     provider = Provider()
-    service = ElectricityService(provider, store)
+    clock = Clock()
+    service = ElectricityService(provider, store, clock=clock)
     await bind(store, location)
     sent = []
 
@@ -241,7 +268,8 @@ async def test_manual_does_not_consume_first_scheduled_warning(store, location):
 
 async def test_manual_failures_stale_and_unbind(store, location):
     provider = Provider()
-    service = ElectricityService(provider, store)
+    clock = Clock()
+    service = ElectricityService(provider, store, clock=clock)
     await bind(store, location)
     await bind(store, location, "2", "group2")
 
@@ -251,9 +279,11 @@ async def test_manual_failures_stale_and_unbind(store, location):
     monitor = Monitor(store, service, send, logging.getLogger())
     result = await monitor.run_manual()
     assert result.sent_messages == result.send_failures == 1
+    clock.advance()
     provider.expired = True
     result = await monitor.run_manual()
     assert result.stale_dorms == 1 and result.sent_messages == 0
+    clock.advance()
     provider.expired = False
 
     async def fail_query():
@@ -280,7 +310,8 @@ async def test_manual_and_scheduled_runs_are_independent(store, location):
     from szu_electricity.models import ElectricityError
 
     provider = Provider()
-    service = ElectricityService(provider, store)
+    clock = Clock()
+    service = ElectricityService(provider, store, clock=clock)
     await bind(store, location)
     entered, release = asyncio.Event(), asyncio.Event()
 

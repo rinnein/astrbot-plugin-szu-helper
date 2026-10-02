@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 RATE = 0.61
 DEFAULT_LOW_POWER_THRESHOLD = 5.0
+CACHE_TTL_SECONDS = 2 * 60 * 60
 
 
 class ElectricityError(Exception):
@@ -162,6 +163,24 @@ class ProviderResult:
     readings: list[Reading]
     remaining: float | None = None
     observed_at: datetime | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "readings": [{**asdict(row), "at": row.at.isoformat()} for row in self.readings],
+            "remaining": self.remaining,
+            "observed_at": self.observed_at.isoformat() if self.observed_at else None,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict) -> ProviderResult:
+        return cls(
+            [
+                Reading(**{**row, "at": datetime.fromisoformat(row["at"])})
+                for row in value["readings"]
+            ],
+            value["remaining"],
+            datetime.fromisoformat(value["observed_at"]) if value["observed_at"] else None,
+        )
 
 
 @dataclass(frozen=True)

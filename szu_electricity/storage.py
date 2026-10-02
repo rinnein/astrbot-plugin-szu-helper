@@ -8,7 +8,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from .models import Binding, Catalog, Location, Report
+from .models import CACHE_TTL_SECONDS, Binding, Catalog, Location, ProviderResult, Report, Window
 
 
 class Store:
@@ -43,6 +43,12 @@ class Store:
             );
             CREATE TABLE IF NOT EXISTS catalogs (
                 source TEXT PRIMARY KEY, fetched_at REAL NOT NULL, value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS query_cache (
+                source TEXT NOT NULL, dorm_key TEXT NOT NULL,
+                begin_date TEXT NOT NULL, end_date TEXT NOT NULL,
+                fetched_at REAL NOT NULL, value TEXT NOT NULL,
+                PRIMARY KEY(source,dorm_key,begin_date,end_date)
             );
             PRAGMA user_version=1;
         """)
@@ -162,6 +168,48 @@ class Store:
             await self.db.execute(
                 "INSERT OR REPLACE INTO catalogs VALUES(?,?,?)",
                 (source, fetched_at, json.dumps(catalog.to_dict(), ensure_ascii=False)),
+            )
+            await self.db.commit()
+
+    async def cached_query(
+        self, source: str, location: Location, window: Window
+    ) -> tuple[float, ProviderResult] | None:
+        async with self.lock:
+            rows = await self._all(
+                "SELECT fetched_at,value FROM query_cache WHERE source=? AND dorm_key=? AND begin_date=? AND end_date=?",
+                (source, location.key, str(window.begin), str(window.end)),
+            )
+            if not rows:
+                return None
+            try:
+                return rows[0]["fetched_at"], ProviderResult.from_dict(json.loads(rows[0]["value"]))
+            except (ValueError, KeyError, TypeError):
+                return None
+
+    async def save_query(
+        self,
+        source: str,
+        location: Location,
+        window: Window,
+        data: ProviderResult,
+        fetched_at: float,
+    ):
+        async with self.lock:
+            assert self.db is not None
+            await self.db.execute(
+                "DELETE FROM query_cache WHERE fetched_at<=? OR fetched_at>?",
+                (fetched_at - CACHE_TTL_SECONDS, fetched_at),
+            )
+            await self.db.execute(
+                "INSERT OR REPLACE INTO query_cache VALUES(?,?,?,?,?,?)",
+                (
+                    source,
+                    location.key,
+                    str(window.begin),
+                    str(window.end),
+                    fetched_at,
+                    json.dumps(data.to_dict(), ensure_ascii=False),
+                ),
             )
             await self.db.commit()
 

@@ -120,23 +120,41 @@ class SzuHelperPlugin(Star):
         parts = event.message_str.strip().split(maxsplit=1)
         return parts[1].strip() if len(parts) > 1 else ""
 
+    @staticmethod
+    def _mention(platform: str, is_group: bool, sender_id: str, name: str):
+        if not is_group or not sender_id:
+            return []
+        if platform in MENTION_PLATFORMS:
+            return [At(qq=sender_id, name=name), Plain("\n")]
+        return [Plain(f"{name or sender_id}\n")]
+
+    async def _reply(self, event: AstrMessageEvent, text: str):
+        chain = self._mention(
+            event.get_platform_name(),
+            bool(event.get_group_id()),
+            event.get_sender_id(),
+            event.get_sender_name(),
+        )
+        # Keep the payload in its own Plain component, including share codes.
+        await event.send(MessageChain([*chain, Plain(text)]))
+
     async def _guard(self, event, work):
         event.stop_event()
         if not self._ready:
-            await event.send(event.plain_result("插件尚未就绪，请稍后重试。"))
+            await self._reply(event, "插件尚未就绪，请稍后重试。")
             return
         if not all(self._identity(event)):
-            await event.send(event.plain_result("当前平台未提供完整的会话或发送人标识，无法绑定。"))
+            await self._reply(event, "当前平台未提供完整的会话或发送人标识，无法绑定。")
             return
         task = asyncio.current_task()
         self._commands.add(task)
         try:
             await work()
         except ElectricityError as exc:
-            await event.send(event.plain_result(str(exc)))
+            await self._reply(event, str(exc))
         except Exception as exc:
             logger.error(f"SZU 指令处理失败：{type(exc).__name__}")
-            await event.send(event.plain_result("操作未完成，请稍后重试或联系管理员查看插件日志。"))
+            await self._reply(event, "操作未完成，请稍后重试或联系管理员查看插件日志。")
         finally:
             self._commands.discard(task)
 
@@ -158,7 +176,7 @@ class SzuHelperPlugin(Star):
         text = f"已绑定：{location.buildingName} {location.roomName}。可发送 /用电 查询。"
         if event.get_platform_name() in NO_PROACTIVE:
             text += "\n当前平台不支持定时主动推送，仍可使用查询命令。"
-        await event.send(event.plain_result(text))
+        await self._reply(event, text)
 
     @filter.command("绑定宿舍")
     async def bind_dorm(self, event: AstrMessageEvent):
@@ -208,7 +226,7 @@ class SzuHelperPlugin(Star):
             reply.stop_event()
             if text in ("取消", "退出"):
                 controller.stop()
-                await reply.send(reply.plain_result("已取消绑定，原配置未变更。"))
+                await self._reply(reply, "已取消绑定，原配置未变更。")
                 return
             try:
                 location = selection.accept(text)
@@ -228,15 +246,15 @@ class SzuHelperPlugin(Star):
             except ElectricityError as exc:
                 prompt = f"{exc}\n{selection.prompt()}"
             controller.keep(timeout=120, reset_timeout=True)
-            await reply.send(reply.plain_result(prompt))
+            await self._reply(reply, prompt)
 
         task = asyncio.create_task(waiter(event, session_filter=SenderSessionFilter(event)))
         try:
             await asyncio.sleep(0)
-            await event.send(event.plain_result(selection.prompt()))
+            await self._reply(event, selection.prompt())
             await task
         except TimeoutError:
-            await event.send(event.plain_result("绑定已超时，原配置未变更。请重新发送 /绑定宿舍。"))
+            await self._reply(event, "绑定已超时，原配置未变更。请重新发送 /绑定宿舍。")
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -253,7 +271,7 @@ class SzuHelperPlugin(Star):
 
         async def work():
             binding = await self._binding(event)
-            await event.send(event.plain_result(encode(binding.location)))
+            await self._reply(event, encode(binding.location))
 
         await self._guard(event, work)
 
@@ -267,7 +285,7 @@ class SzuHelperPlugin(Star):
                 raise ElectricityError("用法：/用电 或 /用电 详情。")
             binding = await self._binding(event)
             report = await self.service.query(binding.location, detail=arg == "详情")
-            await event.send(event.plain_result(render(report, detail=arg == "详情")))
+            await self._reply(event, render(report, detail=arg == "详情"))
 
         await self._guard(event, work)
 
@@ -279,7 +297,7 @@ class SzuHelperPlugin(Star):
             async with self._flow_locks[SenderSessionFilter().filter(event)]:
                 await self._cancel_flow(event)
                 await self.store.unbind(*self._identity(event))
-            await event.send(event.plain_result("已解除当前会话的宿舍绑定及提醒订阅。"))
+            await self._reply(event, "已解除当前会话的宿舍绑定及提醒订阅。")
 
         await self._guard(event, work)
 
@@ -290,17 +308,15 @@ class SzuHelperPlugin(Star):
         # Also enforce authorization when invoked directly by another handler.
         if not event.is_admin():
             event.stop_event()
-            await event.send(event.plain_result("仅 AstrBot 管理员可使用此命令。"))
+            await self._reply(event, "仅 AstrBot 管理员可使用此命令。")
             return
 
         async def work():
             if self._argument(event):
                 raise ElectricityError("用法：/发送低电量预警（无需参数）。")
-            await event.send(
-                event.plain_result("正在检查所有已绑定宿舍，按当前阈值发送一次低电量预警。")
-            )
+            await self._reply(event, "正在检查所有已绑定宿舍，按当前阈值发送一次低电量预警。")
             summary = await self.monitor.run_manual()
-            await event.send(event.plain_result(summary.message()))
+            await self._reply(event, summary.message())
 
         await self._guard(event, work)
 
@@ -311,10 +327,9 @@ class SzuHelperPlugin(Star):
             return False
         chain = []
         for binding in bindings:
-            if binding.is_group and platform in MENTION_PLATFORMS:
-                chain.extend([At(qq=binding.sender_id, name=binding.sender_name), Plain(" ")])
-            elif binding.is_group:
-                chain.append(Plain(f"{binding.sender_name or binding.sender_id} "))
+            chain.extend(
+                self._mention(platform, binding.is_group, binding.sender_id, binding.sender_name)
+            )
         chain.append(
             Plain(
                 f"宿舍 {report.location.buildingName} {report.location.roomName} 剩余电量 {fmt(report.remaining)} 度，低于 {self.monitor.threshold:g} 度，请及时充值。"

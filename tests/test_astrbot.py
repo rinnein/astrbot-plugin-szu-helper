@@ -382,8 +382,6 @@ async def test_all_network_features_follow_selected_source(tmp_path, monkeypatch
         assert [params["days"] for _, path, params in requests if path == "/api/status"] == [
             "3",
             "31",
-            "3",
-            "3",
         ]
         assert await plugin.store.catalog("official") is not None
         assert await plugin.store.catalog("iotun") is not None
@@ -571,3 +569,87 @@ async def test_reuse_decline_can_recover_from_catalog_error(plugin, location):
     assert asdict((await plugin.store.get_binding(*plugin._identity(event))).location) == asdict(
         location
     )
+
+
+def mentioned_ids(message):
+    return [
+        str(component.qq) for component in message.chain if isinstance(component, plugin_module.At)
+    ]
+
+
+async def test_query_and_error_replies_mention_only_initiator(plugin, location):
+    await bind_in_session(plugin, location, group="group1", sender="1")
+    await bind_in_session(plugin, location, group="group1", sender="2")
+    from datetime import datetime
+
+    async def query(location, detail=False):
+        return summarize(
+            location, "official", Window.for_days(3), ProviderResult([], 4, datetime.now(SHANGHAI))
+        )
+
+    plugin.service.query = query
+    for sender in ["1", "2"]:
+        event = Event("用电", sender=sender)
+        await plugin.electricity(event)
+        assert mentioned_ids(event.sent[-1]) == [sender]
+        assert "剩余电量" in event.output()
+    unbound = Event("用电", sender="3")
+    await plugin.electricity(unbound)
+    assert mentioned_ids(unbound.sent[-1]) == ["3"]
+    assert "尚未绑定" in unbound.output()
+
+
+async def test_binding_prompts_and_share_reply_mention_initiator(plugin):
+    event = Event("绑定宿舍")
+    task = await started(plugin, event)
+    assert mentioned_ids(event.sent[0]) == ["1"]
+    for text in ["1", "1", "1", "0601"]:
+        response = await reply(plugin, text)
+        assert all(mentioned_ids(message) == ["1"] for message in response.sent)
+    await task
+    exported = Event("导出宿舍")
+    await plugin.export_dorm(exported)
+    assert mentioned_ids(exported.sent[0]) == ["1"]
+    assert plugin_module.decode(exported.sent[0].chain[-1].text).roomName == "0601"
+
+
+async def test_batch_alerts_mention_owners_but_receipts_mention_admin(plugin, location):
+    from datetime import datetime
+
+    for sender, group in [("1", "group1"), ("2", "group1"), ("3", "group2")]:
+        await bind_in_session(plugin, location, group=group, sender=sender)
+
+    async def query(location, detail=False):
+        return summarize(
+            location, "official", Window.for_days(3), ProviderResult([], 4, datetime.now(SHANGHAI))
+        )
+
+    plugin.service.query = query
+    sent = []
+
+    async def send(origin, chain):
+        sent.append((origin, mentioned_ids(chain)))
+        return True
+
+    plugin.context.send_message = send
+    admin = Event("发送低电量预警", sender="9")
+    admin.role = "admin"
+    await plugin.send_low_power_alert(admin)
+    assert sent == [
+        ("testbot:GroupMessage:group1", ["1", "2"]),
+        ("testbot:GroupMessage:group2", ["3"]),
+    ]
+    assert all(mentioned_ids(message) == ["9"] for message in admin.sent)
+    sent.clear()
+    await plugin.monitor.run()
+    assert sent == [
+        ("testbot:GroupMessage:group1", ["1", "2"]),
+        ("testbot:GroupMessage:group2", ["3"]),
+    ]
+
+
+async def test_private_reply_has_no_group_mention(plugin):
+    event = Event("用电", group="")
+    await plugin.electricity(event)
+    assert mentioned_ids(event.sent[0]) == []
+    assert "尚未绑定" in event.output()
