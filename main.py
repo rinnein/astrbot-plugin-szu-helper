@@ -15,7 +15,7 @@ from astrbot.core.utils.session_waiter import SessionController, SessionFilter, 
 
 from .szu_electricity.analytics import fmt, render
 from .szu_electricity.config import Settings
-from .szu_electricity.conversation import Selection
+from .szu_electricity.conversation import ReuseSelection, Selection
 from .szu_electricity.models import SHANGHAI, Binding, ElectricityError, Location, Report
 from .szu_electricity.monitor import Monitor
 from .szu_electricity.providers import IotunProvider, OfficialProvider
@@ -184,16 +184,23 @@ class SzuHelperPlugin(Star):
 
     async def _begin_bind(self, event):
         code = self._argument(event)
-        location = decode(code) if code else None
-        catalog = await self.service.catalog()
-        if location:
+        if code:
+            location = decode(code)
+            catalog = await self.service.catalog()
             await self._save(event, catalog.validate(location))
-        else:
-            await self._select(event, Selection(catalog))
+            return
+        locations = await self.store.other_locations(*self._identity(event))
+        if locations:
+            # Reusing an already saved location is a local operation. Only a
+            # choice to start over needs the currently selected data source.
+            await self._select(event, ReuseSelection(locations))
+            return
+        await self._select(event, Selection(await self.service.catalog()))
 
-    async def _select(self, event, selection: Selection):
+    async def _select(self, event, selection: Selection | ReuseSelection):
         @session_waiter(timeout=120, record_history_chains=False)
         async def waiter(controller: SessionController, reply: AstrMessageEvent):
+            nonlocal selection
             text = reply.message_str.strip()
             command = text.lstrip("/").split(maxsplit=1)[0] if text else ""
             if command in COMMANDS or text.startswith("/"):
@@ -207,7 +214,13 @@ class SzuHelperPlugin(Star):
                 location = selection.accept(text)
                 if controller.future.done():
                     return
-                if location:
+                if location == "new":
+                    controller.keep(timeout=120, reset_timeout=True)
+                    catalog = await self.service.catalog()
+                    if controller.future.done():
+                        return
+                    selection = Selection(catalog)
+                elif location:
                     await self._save(reply, location)
                     controller.stop()
                     return

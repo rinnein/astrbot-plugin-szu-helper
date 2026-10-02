@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import types
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -397,3 +398,176 @@ async def test_all_network_features_follow_selected_source(tmp_path, monkeypatch
     finally:
         await plugin.terminate()
         await asyncio.sleep(0)
+
+
+async def bind_in_session(
+    plugin, location, *, group="source-group", sender="1", platform="testbot"
+):
+    event = Event("绑定宿舍", sender=sender, group=group, platform=platform)
+    await plugin.store.bind(
+        *plugin._identity(event), event.get_sender_name(), bool(group), "aiocqhttp", location
+    )
+    return event
+
+
+async def test_reuse_confirmation_is_local_and_preserves_source(plugin, location):
+    from dataclasses import replace
+    from datetime import datetime
+
+    source = await bind_in_session(plugin, location)
+    previous = replace(location, roomName="0801")
+    target = await bind_in_session(plugin, previous, group="group1")
+    source_binding = await plugin.store.get_binding(*plugin._identity(source))
+    report = summarize(
+        location, "official", Window.for_days(3), ProviderResult([], 4, datetime.now(SHANGHAI))
+    )
+    episode = await plugin.store.observe(report, 5)
+
+    async def sent(_):
+        return True
+
+    await plugin.store.deliver(
+        location.key, episode, source.unified_msg_origin, [source_binding.id], sent
+    )
+    deliveries = [tuple(row) for row in await plugin.store._all("SELECT * FROM deliveries")]
+
+    async def no_network():
+        raise AssertionError("Reusing a binding must not load the catalog")
+
+    plugin.service.catalog = no_network
+
+    task = await started(plugin, target)
+    assert "是否直接复用" in target.output() and "山茶斋 0601" in target.output()
+    assert source.unified_msg_origin not in target.output()
+    assert asdict((await plugin.store.get_binding(*plugin._identity(target))).location) == asdict(
+        previous
+    )
+    outsider = await reply(plugin, "是", sender="2")
+    assert not outsider.is_stopped()
+    assert asdict((await plugin.store.get_binding(*plugin._identity(target))).location) == asdict(
+        previous
+    )
+    accepted = await reply(plugin, "是")
+    await task
+    assert "已绑定" in accepted.output()
+    assert asdict((await plugin.store.get_binding(*plugin._identity(target))).location) == asdict(
+        location
+    )
+    assert await plugin.store.get_binding(*plugin._identity(source)) == source_binding
+    assert [tuple(row) for row in await plugin.store._all("SELECT * FROM deliveries")] == deliveries
+
+
+@pytest.mark.parametrize("source", ["current-session", "other-user", "other-platform"])
+async def test_reuse_excludes_unrelated_bindings(plugin, location, source):
+    if source == "current-session":
+        await bind_in_session(plugin, location, group="group1")
+    elif source == "other-user":
+        await bind_in_session(plugin, location, sender="2")
+    else:
+        await bind_in_session(plugin, location, platform="other-bot")
+    event = Event("绑定宿舍")
+    task = await started(plugin, event)
+    assert "请选择校区" in event.output() and "复用" not in event.output()
+    await reply(plugin, "取消")
+    await task
+
+
+async def test_reuse_multiple_dorms_deduplicates_and_selects(plugin, location):
+    from dataclasses import replace
+
+    await bind_in_session(plugin, location, group="source1")
+    second = replace(location, roomName="0801")
+    await bind_in_session(plugin, second, group="source2")
+    await bind_in_session(plugin, location, group="source3")
+    event = Event("绑定宿舍")
+    task = await started(plugin, event)
+    assert "多个宿舍" in event.output()
+    assert event.output().count("0601") == event.output().count("0801") == 1
+    invalid = await reply(plugin, "99")
+    assert "请回复已有宿舍的编号" in invalid.output()
+    assert await plugin.store.get_binding(*plugin._identity(event)) is None
+    await reply(plugin, "2")
+    await task
+    assert asdict((await plugin.store.get_binding(*plugin._identity(event))).location) == asdict(
+        second
+    )
+
+
+async def test_reuse_decline_loads_current_source_then_selects(plugin, location, catalog):
+    source = await bind_in_session(plugin, location, group="")  # private -> group
+    calls = []
+
+    async def current_catalog():
+        calls.append(plugin.service.provider.name)
+        return catalog
+
+    plugin.service.catalog = current_catalog
+    event = Event("绑定宿舍")
+    task = await started(plugin, event)
+    assert not calls
+    plugin.config["data_source"] = "iotun"
+    declined = await reply(plugin, "否")
+    assert "请选择校区" in declined.output() and calls == ["iotun"]
+    for text in ["1", "1", "1", "0901"]:
+        await reply(plugin, text)
+    await task
+    assert (await plugin.store.get_binding(*plugin._identity(event))).location.roomName == "0901"
+    assert asdict((await plugin.store.get_binding(*plugin._identity(source))).location) == asdict(
+        location
+    )
+
+
+@pytest.mark.parametrize("action", ["取消", "timeout"])
+async def test_reuse_cancel_and_timeout_preserve_current_binding(plugin, location, action):
+    from dataclasses import replace
+
+    await bind_in_session(plugin, location)
+    old = replace(location, roomName="0801")
+    target = await bind_in_session(plugin, old, group="group1")
+    task = await started(plugin, target)
+    if action == "timeout":
+        key = plugin_module.SenderSessionFilter().filter(target)
+        USER_SESSIONS[key].session_controller.keep(timeout=0.01, reset_timeout=True)
+    else:
+        await reply(plugin, action)
+    await task
+    assert asdict((await plugin.store.get_binding(*plugin._identity(target))).location) == asdict(
+        old
+    )
+    assert not plugin._flows
+
+
+async def test_explicit_import_replaces_reuse_prompt(plugin, location):
+    from dataclasses import replace
+
+    await bind_in_session(plugin, location)
+    event = Event("绑定宿舍")
+    waiting = await started(plugin, event)
+    imported = replace(location, roomName="0901")
+    command = await reply(plugin, "绑定宿舍 " + encode(imported))
+    assert not command.is_stopped()
+    await plugin.bind_dorm(command)
+    await waiting
+    assert "已绑定" in command.output() and "复用" not in command.output()
+    assert asdict((await plugin.store.get_binding(*plugin._identity(command))).location) == asdict(
+        imported
+    )
+
+
+async def test_reuse_decline_can_recover_from_catalog_error(plugin, location):
+    await bind_in_session(plugin, location)
+
+    async def unavailable():
+        raise plugin_module.ElectricityError("iotun 暂不可用")
+
+    plugin.service.catalog = unavailable
+    event = Event("绑定宿舍")
+    task = await started(plugin, event)
+    declined = await reply(plugin, "否")
+    assert "iotun 暂不可用" in declined.output() and "是否直接复用" in declined.output()
+    assert await plugin.store.get_binding(*plugin._identity(event)) is None
+    await reply(plugin, "是")
+    await task
+    assert asdict((await plugin.store.get_binding(*plugin._identity(event))).location) == asdict(
+        location
+    )

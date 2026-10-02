@@ -188,3 +188,19 @@ def test_reference_project_sharing_vectors():
         assert encode(expected) == vector["code"]
         assert catalog.validate(decode(vector["code"])) == expected
     assert all(area.buildings for area in catalog.areas)
+
+
+def test_reuse_options_paginate_without_accepting_ambiguous_yes(location):
+    from dataclasses import replace
+
+    from szu_electricity.conversation import ReuseSelection
+
+    choices = [replace(location, roomName=str(n)) for n in range(100, 116)]
+    selection = ReuseSelection(choices)
+    assert "第 1/2 页" in selection.prompt()
+    assert selection.accept("下一页") is None
+    assert "第 2/2 页" in selection.prompt() and "16." in selection.prompt()
+    assert selection.accept("16") == choices[15]
+    with pytest.raises(ElectricityError):
+        selection.accept("是")
+    assert selection.accept("0") == "new"

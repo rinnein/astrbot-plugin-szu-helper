@@ -80,6 +80,19 @@ class Store:
             )
             return self._binding(rows[0]) if rows else None
 
+    async def other_locations(self, platform: str, origin: str, sender: str) -> list[Location]:
+        """Distinct dorms owned by this sender in other sessions of the same bot."""
+        async with self.lock:
+            rows = await self._all(
+                "SELECT * FROM bindings WHERE platform_id=? AND sender_id=? AND origin<>? ORDER BY id DESC",
+                (platform, sender, origin),
+            )
+            locations = {}
+            for row in rows:
+                location = self._binding(row).location
+                locations.setdefault(location.key, location)
+            return list(locations.values())
+
     async def bind(
         self,
         platform: str,

@@ -1,6 +1,62 @@
 from dataclasses import dataclass
+from typing import Literal
 
+from .catalog import empty_catalog
 from .models import Catalog, ElectricityError, Location
+
+
+@dataclass
+class ReuseSelection:
+    locations: list[Location]
+    page: int = 0
+
+    @staticmethod
+    def label(location: Location) -> str:
+        catalog = empty_catalog()
+        area = next((a.name for a in catalog.areas if a.id == location.areaId), location.areaId)
+        return f"{area} · {location.buildingName} {location.roomName}"
+
+    def prompt(self) -> str:
+        if len(self.locations) == 1:
+            return (
+                f"发现你在其他会话绑定过宿舍：\n{self.label(self.locations[0])}\n"
+                "是否直接复用到当前会话？\n"
+                "1. 复用已有绑定（也可回复“是”）\n"
+                "2. 重新选择宿舍（也可回复“否”）\n"
+                "回复“取消”结束；请在 120 秒内回复。"
+            )
+        start = self.page * 15
+        items = [
+            f"{i + 1}. {self.label(location)}"
+            for i, location in enumerate(self.locations[start : start + 15], start)
+        ]
+        return "\n".join(
+            [
+                "发现你在其他会话绑定过多个宿舍，请选择要复用的宿舍编号：",
+                *items,
+                "0. 重新选择宿舍",
+                f"第 {self.page + 1}/{(len(self.locations) + 14) // 15} 页 · 上一页 / 下一页 / 取消",
+                "请在 120 秒内回复。",
+            ]
+        )
+
+    def accept(self, text: str) -> Location | Literal["new"] | None:
+        text = text.strip()
+        if text in ("0", "否", "重新选择", "重新选择宿舍"):
+            return "new"
+        if len(self.locations) == 1:
+            if text in ("1", "是", "复用", "确认"):
+                return self.locations[0]
+            if text == "2":
+                return "new"
+            raise ElectricityError("请回复“是”复用，或“否”重新选择宿舍。")
+        if text in ("上一页", "下一页"):
+            change = -1 if text == "上一页" else 1
+            self.page = min(max(0, self.page + change), (len(self.locations) - 1) // 15)
+            return None
+        if text.isascii() and text.isdigit() and 1 <= int(text) <= len(self.locations):
+            return self.locations[int(text) - 1]
+        raise ElectricityError("请回复已有宿舍的编号，或回复 0 重新选择宿舍。")
 
 
 @dataclass
