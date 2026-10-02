@@ -11,6 +11,7 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 RATE = 0.61
 DEFAULT_LOW_POWER_THRESHOLD = 5.0
 CACHE_TTL_SECONDS = 2 * 60 * 60
+MAX_READING_AGE = timedelta(hours=48)
 
 
 class ElectricityError(Exception):
@@ -18,7 +19,11 @@ class ElectricityError(Exception):
 
 
 def today() -> date:
-    return datetime.now(SHANGHAI).date()
+    return local_now().date()
+
+
+def local_now() -> datetime:
+    return datetime.now(SHANGHAI)
 
 
 def number(value: object) -> float | None:
@@ -195,6 +200,7 @@ class Report:
     daily_average: float | None
     valid_days: int
     estimated_days: float | None
+    unavailable_reason: str | None = None
 
 
 @dataclass(frozen=True)

@@ -28,7 +28,7 @@ class Source:
         self.calls.append((location.key, window.days))
         if self.failure:
             raise ElectricityError("temporary failure")
-        at = datetime.combine(window.end, time(12), tzinfo=SHANGHAI)
+        at = datetime.combine(window.end, time.min, tzinfo=SHANGHAI)
         if self.expired:
             at -= timedelta(days=3)
         return ProviderResult([Reading(at, remaining=self.balance, daily=2)], self.balance, at)
@@ -126,4 +126,35 @@ async def test_catalog_cache_uses_two_hours_and_source_isolation(store):
     now[0] += 1
     await service.catalog()
     assert iotun.catalog_calls == 2
+    await service.close()
+
+
+async def test_cache_does_not_renew_reading_age(monkeypatch, store, location):
+    from szu_electricity import service as service_module
+
+    now = [datetime.now(SHANGHAI).replace(hour=12, minute=0, second=0, microsecond=0)]
+    clock = [1000.0]
+    monkeypatch.setattr(service_module, "local_now", lambda: now[0])
+    source = Source()
+    data = [ProviderResult([], 88, now[0] - timedelta(hours=47, minutes=55))]
+    calls = []
+
+    async def query(location, window):
+        calls.append(window)
+        return data[0]
+
+    source.query = query
+    service = ElectricityService(source, store, clock=lambda: clock[0])
+    first = await service.query(location)
+    assert not first.expired
+    now[0] += timedelta(minutes=1)
+    clock[0] += 60
+    cached = await service.query(location)
+    assert cached.observed_at == first.observed_at and len(calls) == 1
+    now[0] += timedelta(minutes=5)
+    clock[0] += 300
+    data[0] = ProviderResult([], 87, now[0])
+    refreshed = await service.query(location)
+    assert len(calls) == 2 and refreshed.remaining == 87
+    assert refreshed.observed_at == now[0]
     await service.close()

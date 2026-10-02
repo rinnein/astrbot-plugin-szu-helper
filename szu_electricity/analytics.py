@@ -1,9 +1,29 @@
-from datetime import timedelta
+from datetime import datetime, time, timedelta
 
-from .models import RATE, Location, ProviderResult, Reading, Report, Window, number
+from .models import (
+    MAX_READING_AGE,
+    RATE,
+    SHANGHAI,
+    Location,
+    ProviderResult,
+    Reading,
+    Report,
+    Window,
+    number,
+)
 
 
-def summarize(location: Location, source: str, window: Window, data: ProviderResult) -> Report:
+def summarize(
+    location: Location,
+    source: str,
+    window: Window,
+    data: ProviderResult,
+    *,
+    now: datetime | None = None,
+) -> Report:
+    # Service callers supply the actual local clock. The end-of-day default
+    # keeps historical/statistical calls deterministic for their explicit window.
+    now = now or datetime.combine(window.end, time.max, tzinfo=SHANGHAI)
     days: dict = {}
     for row in sorted(data.readings, key=lambda r: r.at):
         if window.begin <= row.at.date() <= window.end:
@@ -27,9 +47,22 @@ def summarize(location: Location, source: str, window: Window, data: ProviderRes
             if number(row.remaining) is not None:
                 remaining, observed = number(row.remaining), row.at
                 break
-    expired = observed is None or not (
-        window.end - timedelta(days=1) <= observed.date() <= window.end
-    )
+    elif observed is None:
+        # A summary may omit its timestamp even though the same measured balance
+        # and timestamp are present in the records. Never borrow a usage-only date.
+        observed = next(
+            (row.at for row in reversed(rows) if number(row.remaining) == remaining), None
+        )
+    unavailable_reason = None
+    if remaining is None:
+        unavailable_reason = "missing_balance"
+    elif observed is None:
+        unavailable_reason = "missing_timestamp"
+    elif observed > now:
+        unavailable_reason = "future_timestamp"
+    elif now - observed > MAX_READING_AGE:
+        unavailable_reason = "stale"
+    expired = unavailable_reason is not None
     start = window.end - timedelta(days=2)
     recent = [
         v
@@ -52,6 +85,7 @@ def summarize(location: Location, source: str, window: Window, data: ProviderRes
         total / len(usage) if usage else None,
         len(usage),
         estimated,
+        unavailable_reason,
     )
 
 
@@ -80,5 +114,17 @@ def render(report: Report, detail: bool = False) -> str:
             f"读数日期：{report.observed_at.date() if report.observed_at else '暂无'} · 来源：{'学校官方' if report.source == 'official' else 'iotun.com'}",
         ]
     if report.expired:
-        lines.append("读数已过期或缺失，不能用于预测及低电量提醒。")
+        if report.unavailable_reason == "missing_balance":
+            lines.append("数据源未返回剩余电量，暂不能预测或判断低电量。")
+        elif report.unavailable_reason == "missing_timestamp":
+            lines.append("余额缺少有效的读数时间，暂不能预测或判断低电量。")
+        elif report.unavailable_reason == "future_timestamp":
+            lines.append("数据源的读数时间晚于当前时间，暂不能预测或判断低电量。")
+        else:
+            observed = (
+                report.observed_at.strftime("%Y-%m-%d %H:%M") if report.observed_at else "未知"
+            )
+            lines.append(f"余额读数已过期（{observed}，有效期 48 小时），暂不能预测或判断低电量。")
+    elif report.estimated_days is None:
+        lines.append("近 3 天有效用量不足或日均为零，暂无法估算；剩余电量仍可用于低电量提醒。")
     return "\n".join(lines)

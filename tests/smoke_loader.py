@@ -24,6 +24,7 @@ shutil.copytree(
 (runtime / "data/config").mkdir(parents=True, exist_ok=True)
 from astrbot.api import AstrBotConfig
 from astrbot.api.star import Context
+from astrbot.core.log import LogManager
 from astrbot.core.star.star import star_registry
 from astrbot.core.star.star_manager import PluginManager
 
@@ -38,6 +39,17 @@ async def main():
     old = meta.star_cls
     assert old._ready and len(old.scheduler.get_jobs()) == 1
     assert len(meta.star_handler_full_names) == 5
+    if hasattr(LogManager, "get_plugin_logger"):
+        import logging
+
+        assert old.logger.name == "astrbot.plugin.astrbot_plugin_szu_helper"
+        assert old.service.logger is old.monitor.logger is old.logger
+        assert old.service.provider.logger is old.logger
+        LogManager.set_plugin_log_level(meta.name, "DEBUG")
+        assert old.service.logger.isEnabledFor(logging.DEBUG)
+        LogManager.set_plugin_log_level(meta.name, "WARNING")
+        assert not old.service.logger.isEnabledFor(logging.INFO)
+        LogManager.set_plugin_log_level(meta.name, None)
     old.config["daily_check_time"] = "21:30"
     old.config["low_power_threshold"] = 7.5
     old.config.save_config()

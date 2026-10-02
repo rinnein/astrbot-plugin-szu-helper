@@ -375,3 +375,29 @@ async def test_source_switch_does_not_join_or_relabel_previous_query(store, loca
     previous = await pending
     assert previous.source == "official" and official.calls == 1
     await service.close()
+
+
+async def test_valid_balance_can_alert_without_a_prediction(store, location):
+    from types import SimpleNamespace
+
+    now = datetime(2026, 10, 3, 0, 15, tzinfo=SHANGHAI)
+    observed = datetime(2026, 10, 1, 23, 59, tzinfo=SHANGHAI)
+    report = summarize(
+        location, "iotun", Window.for_days(3, now.date()), ProviderResult([], 88, observed), now=now
+    )
+
+    async def query(_):
+        return report
+
+    service = SimpleNamespace(query=query)
+    await bind(store, location)
+    sent = []
+
+    async def send(bindings, result):
+        sent.append(result)
+        return True
+
+    monitor = Monitor(store, service, send, logging.getLogger(), threshold=100)
+    result = await monitor.run_manual()
+    assert result.sent_messages == 1 and result.stale_dorms == 0
+    assert sent[0].estimated_days is None

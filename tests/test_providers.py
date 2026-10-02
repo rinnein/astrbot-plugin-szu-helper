@@ -213,3 +213,50 @@ async def test_uncompressed_body_limit_applies_to_compressed_responses():
     )() as client:
         with pytest.raises(ElectricityError, match="过大"):
             await request(client, "GET", "https://www.iotun.com/api/buildings", source="iotun")
+
+
+@pytest.mark.parametrize("area", ["yuehai-main", "xili-lihuo-phase2"])
+async def test_iotun_live_balance_is_independent_of_old_usage_dates(monkeypatch, area):
+    from datetime import datetime
+
+    from szu_electricity import providers
+    from szu_electricity.analytics import summarize
+    from szu_electricity.models import SHANGHAI
+
+    now = datetime(2026, 10, 3, 0, 15, tzinfo=SHANGHAI)
+    monkeypatch.setattr(providers, "local_now", lambda: now)
+    location = Location(
+        "yuehai" if area == "yuehai-main" else "xili",
+        area,
+        "54" if area == "yuehai-main" else "01",
+        "山茶斋" if area == "yuehai-main" else "梧桐树",
+        "601",
+    )
+    data = {"remaining": 88, "last_record": "2026-09-29", "trend": []}
+    provider = IotunProvider(
+        factory(lambda req: httpx.Response(200, json={"ok": True, "data": data}))
+    )
+    window = Window.for_days(3, now.date())
+    result = await provider.query(location, window)
+    assert result.observed_at == now
+    report = summarize(location, "iotun", window, result, now=now)
+    assert report.remaining == 88 and not report.expired
+    assert report.estimated_days is None
+
+
+async def test_iotun_sims_retains_actual_old_meter_date():
+    from datetime import datetime
+
+    from szu_electricity.analytics import summarize
+    from szu_electricity.models import SHANGHAI
+
+    location = Location("yuehai", "yuehai-xinzhai", "7126", "风槐斋", "601")
+    data = {"remaining": 88, "last_record": "2026-09-29 23:59:00", "trend": []}
+    provider = IotunProvider(
+        factory(lambda req: httpx.Response(200, json={"ok": True, "data": data}))
+    )
+    now = datetime(2026, 10, 3, 0, 15, tzinfo=SHANGHAI)
+    window = Window.for_days(3, now.date())
+    result = await provider.query(location, window)
+    report = summarize(location, "iotun", window, result, now=now)
+    assert report.expired and report.unavailable_reason == "stale"

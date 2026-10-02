@@ -348,8 +348,12 @@ async def test_all_network_features_follow_selected_source(tmp_path, monkeypatch
     def factory():
         return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
-    monkeypatch.setattr(plugin_module, "OfficialProvider", lambda: OfficialProvider(factory))
-    monkeypatch.setattr(plugin_module, "IotunProvider", lambda: IotunProvider(factory))
+    monkeypatch.setattr(
+        plugin_module, "OfficialProvider", lambda **kwargs: OfficialProvider(factory, **kwargs)
+    )
+    monkeypatch.setattr(
+        plugin_module, "IotunProvider", lambda **kwargs: IotunProvider(factory, **kwargs)
+    )
     monkeypatch.setattr(plugin_module, "get_astrbot_data_path", lambda: str(tmp_path))
     config = AstrBotConfig(
         str(tmp_path / "config.json"), schema=json.loads((root / "_conf_schema.json").read_text())

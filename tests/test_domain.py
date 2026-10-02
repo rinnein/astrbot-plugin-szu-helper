@@ -204,3 +204,55 @@ def test_reuse_options_paginate_without_accepting_ambiguous_yes(location):
     with pytest.raises(ElectricityError):
         selection.accept("是")
     assert selection.accept("0") == "new"
+
+
+def test_midnight_does_not_expire_a_24_hour_old_balance(location):
+    now = datetime(2026, 10, 3, 0, 15, tzinfo=SHANGHAI)
+    observed = datetime(2026, 10, 1, 23, 59, tzinfo=SHANGHAI)
+    data = ProviderResult([Reading(observed, remaining=88, cumulative=100)])
+    report = summarize(location, "iotun", Window.for_days(3, now.date()), data, now=now)
+    assert not report.expired and report.unavailable_reason is None
+    assert report.remaining == 88 and report.estimated_days is None
+    assert "仍可用于低电量提醒" in render(report)
+    assert "已过期" not in render(report)
+
+
+@pytest.mark.parametrize("age,expired", [(48 * 3600, False), (48 * 3600 + 1, True), (-1, True)])
+def test_balance_freshness_has_elapsed_time_boundary(location, age, expired):
+    now = datetime(2026, 10, 3, 12, tzinfo=SHANGHAI)
+    observed = now - timedelta(seconds=age)
+    report = summarize(
+        location,
+        "official",
+        Window.for_days(3, now.date()),
+        ProviderResult([], 4, observed),
+        now=now,
+    )
+    assert report.expired is expired
+    if age < 0:
+        assert report.unavailable_reason == "future_timestamp"
+    elif expired:
+        assert report.unavailable_reason == "stale"
+
+
+def test_missing_summary_timestamp_uses_only_matching_measured_balance(location):
+    now = datetime(2026, 10, 3, 12, tzinfo=SHANGHAI)
+    window = Window.for_days(3, now.date())
+    observed = now - timedelta(hours=2)
+    data = ProviderResult([Reading(observed, remaining=4)], 4, None)
+    report = summarize(location, "iotun", window, data, now=now)
+    assert report.observed_at == observed and not report.expired
+    data = ProviderResult([Reading(observed, remaining=5)], 4, None)
+    assert (
+        summarize(location, "iotun", window, data, now=now).unavailable_reason
+        == "missing_timestamp"
+    )
+    data = ProviderResult([Reading(observed, daily=2)], 4, None)
+    assert (
+        summarize(location, "iotun", window, data, now=now).unavailable_reason
+        == "missing_timestamp"
+    )
+    data = ProviderResult([Reading(observed, daily=2)], None, observed)
+    assert (
+        summarize(location, "iotun", window, data, now=now).unavailable_reason == "missing_balance"
+    )

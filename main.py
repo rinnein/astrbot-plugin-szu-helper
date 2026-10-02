@@ -6,7 +6,8 @@ from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from astrbot.api import AstrBotConfig, logger
+from astrbot.api import AstrBotConfig
+from astrbot.api import logger as astrbot_logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import At, Plain
 from astrbot.api.star import Context, Star
@@ -55,6 +56,10 @@ class SenderSessionFilter(SessionFilter):
 class SzuHelperPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        # AstrBot 4.28 provides a dedicated logger with WebUI level controls.
+        # Keep compatibility with versions predating Star.logger.
+        if not hasattr(self, "logger"):
+            self.logger = astrbot_logger
         self.config = config
         self.store = Store(
             Path(get_astrbot_data_path())
@@ -73,14 +78,18 @@ class SzuHelperPlugin(Star):
     async def initialize(self):
         settings = Settings.parse(self.config)
         await self.store.open()
-        providers = {"official": OfficialProvider(), "iotun": IotunProvider()}
+        providers = {
+            "official": OfficialProvider(logger=self.logger),
+            "iotun": IotunProvider(logger=self.logger),
+        }
         self.service = ElectricityService(
             providers[settings.source],
             self.store,
             provider_selector=lambda: providers[Settings.parse(self.config).source],
+            logger=self.logger,
         )
         self.monitor = Monitor(
-            self.store, self.service, self._notify, logger, settings.low_power_threshold
+            self.store, self.service, self._notify, self.logger, settings.low_power_threshold
         )
         self.scheduler = AsyncIOScheduler(timezone=SHANGHAI)
         if settings.enabled:
@@ -95,6 +104,14 @@ class SzuHelperPlugin(Star):
             )
         self.scheduler.start()
         self._ready = True
+        self.logger.info(
+            "SZU 插件就绪 source=%s daily_check=%s time=%02d:%02d threshold=%g",
+            settings.source,
+            settings.enabled,
+            settings.hour,
+            settings.minute,
+            settings.low_power_threshold,
+        )
 
     async def terminate(self):
         self._ready = False
@@ -110,6 +127,7 @@ class SzuHelperPlugin(Star):
         if self.service:
             await self.service.close()
         await self.store.close()
+        self.logger.info("SZU 插件已停止，任务及数据库连接已关闭")
 
     @staticmethod
     def _identity(event):
@@ -148,12 +166,20 @@ class SzuHelperPlugin(Star):
             return
         task = asyncio.current_task()
         self._commands.add(task)
+        token = (
+            event.message_str.strip().split(maxsplit=1)[0].lstrip("/")
+            if event.message_str.strip()
+            else ""
+        )
+        command = token if token in COMMANDS else "unknown"
+        self.logger.debug("处理指令 command=%s platform=%s", command, event.get_platform_name())
         try:
             await work()
         except ElectricityError as exc:
+            self.logger.warning("指令未完成 command=%s reason=%s", command, str(exc))
             await self._reply(event, str(exc))
         except Exception as exc:
-            logger.error(f"SZU 指令处理失败：{type(exc).__name__}")
+            self.logger.error("指令处理异常 command=%s error=%s", command, type(exc).__name__)
             await self._reply(event, "操作未完成，请稍后重试或联系管理员查看插件日志。")
         finally:
             self._commands.discard(task)
@@ -174,6 +200,11 @@ class SzuHelperPlugin(Star):
             location,
         )
         text = f"已绑定：{location.buildingName} {location.roomName}。可发送 /用电 查询。"
+        self.logger.info(
+            "宿舍绑定已保存 platform=%s group=%s",
+            event.get_platform_name(),
+            bool(event.get_group_id()),
+        )
         platform = self.context.get_platform_inst(event.get_platform_id())
         if platform is not None and not getattr(platform.meta(), "support_proactive_message", True):
             text += "\n当前平台不支持定时主动推送，仍可使用查询命令。"
@@ -210,6 +241,7 @@ class SzuHelperPlugin(Star):
             return
         locations = await self.store.other_locations(*self._identity(event))
         if locations:
+            self.logger.debug("发现可复用的宿舍配置 count=%s", len(locations))
             # Reusing an already saved location is a local operation. Only a
             # choice to start over needs the currently selected data source.
             await self._select(event, ReuseSelection(locations))
@@ -360,4 +392,10 @@ class SzuHelperPlugin(Star):
         sent = await self.context.send_message(bindings[0].origin, MessageChain(chain))
         if not sent:
             raise ElectricityError("主动发送时未找到目标平台实例，请检查机器人连接状态。")
+        self.logger.info(
+            "低电量预警已发送 platform=%s group=%s recipients=%s",
+            platform,
+            bindings[0].is_group,
+            len(bindings),
+        )
         return bool(sent)

@@ -59,9 +59,18 @@ class Monitor:
             return await self._scan(manual=True)
 
     async def _scan(self, *, manual: bool) -> CheckSummary:
+        mode = "manual" if manual else "scheduled"
         groups = defaultdict(list)
-        for binding in await self.store.bindings():
+        bindings = await self.store.bindings()
+        for binding in bindings:
             groups[binding.location.key].append(binding)
+        self.logger.info(
+            "开始低电量检查 mode=%s bindings=%s dorms=%s threshold=%g",
+            mode,
+            len(bindings),
+            len(groups),
+            self.threshold,
+        )
         tasks = [
             asyncio.create_task(self._check(bindings, manual=manual))
             for bindings in groups.values()
@@ -69,7 +78,7 @@ class Monitor:
         self._running.update(tasks)
         try:
             results = await asyncio.gather(*tasks)
-            return CheckSummary(
+            summary = CheckSummary(
                 **{
                     field: sum(getattr(result, field) for result in results)
                     for field in CheckSummary.__dataclass_fields__
@@ -77,6 +86,17 @@ class Monitor:
                 },
                 send_errors=[reason for result in results for reason in result.send_errors],
             )
+            self.logger.info(
+                "低电量检查完成 mode=%s dorms=%s low=%s sent=%s send_failures=%s query_failures=%s unavailable=%s",
+                mode,
+                summary.checked_dorms,
+                summary.low_dorms,
+                summary.sent_messages,
+                summary.send_failures,
+                summary.query_failures,
+                summary.stale_dorms,
+            )
+            return summary
         finally:
             self._running.difference_update(tasks)
 
@@ -85,9 +105,21 @@ class Monitor:
         try:
             report = await self.service.query(bindings[0].location)
             if report.expired or report.remaining is None or report.observed_at is None:
+                self.logger.warning(
+                    "跳过不可用余额 source=%s reason=%s observed_at=%s",
+                    report.source,
+                    report.unavailable_reason,
+                    report.observed_at,
+                )
                 result.stale_dorms = 1
                 return result
             result.low_dorms = int(report.remaining < self.threshold)
+            self.logger.debug(
+                "低电量判定 source=%s below_threshold=%s observed_at=%s",
+                report.source,
+                bool(result.low_dorms),
+                report.observed_at,
+            )
             if manual:
                 if not result.low_dorms:
                     return result

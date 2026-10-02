@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from collections.abc import Callable
 from datetime import datetime
@@ -20,6 +21,7 @@ from .models import (
     Reading,
     Window,
     building_name,
+    local_now,
     number,
     timestamp,
 )
@@ -215,10 +217,12 @@ def lihu_remaining(page: BeautifulSoup) -> float | None:
 class OfficialProvider:
     name = "official"
 
-    def __init__(self, client_factory: Callable = new_client):
+    def __init__(self, client_factory: Callable = new_client, *, logger=None):
         self.client_factory = client_factory
+        self.logger = logger or logging.getLogger(__name__)
 
     async def catalog(self) -> Catalog:
+        self.logger.debug("official: loading campus portal catalogs")
         catalog = empty_catalog()
         # Sequential station selection: these portals store active state in cookies.
         async with self.client_factory() as client:
@@ -238,6 +242,11 @@ class OfficialProvider:
         return catalog
 
     async def query(self, location: Location, window: Window) -> ProviderResult:
+        self.logger.debug(
+            "official: query backend=%s days=%s",
+            "lihu" if location.areaId == "xili-lihuo-phase2" else "sims",
+            window.days,
+        )
         rows = []
         balance, observed = None, None
         for chunk in window.chunks():
@@ -396,14 +405,16 @@ class OfficialProvider:
 class IotunProvider:
     name = "iotun"
 
-    def __init__(self, client_factory: Callable = new_iotun_client):
+    def __init__(self, client_factory: Callable = new_iotun_client, *, logger=None):
         self.client_factory = client_factory
+        self.logger = logger or logging.getLogger(__name__)
 
     async def _get(self, path: str, params: dict | None = None):
         # Retry this same public endpoint once for transient network/gateway
         # failures. No request falls back to a school endpoint or another source.
         for attempt in range(2):
             try:
+                self.logger.debug("iotun: GET %s attempt=%s", path, attempt + 1)
                 async with self.client_factory() as client:
                     response = await request(
                         client, "GET", IOTUN_BASE + path, source=self.name, params=params
@@ -419,6 +430,7 @@ class IotunProvider:
                 )
                 if attempt or not transient:
                     raise
+                self.logger.warning("iotun: retrying %s after %s", path, type(cause).__name__)
                 await asyncio.sleep(0.5)
         try:
             value = response.json()
@@ -463,7 +475,19 @@ class IotunProvider:
                     number(row.get("daily_used_kwh")) if direct else None,
                 )
             )
-        # Never use reconstructed historical apartment balances as observations.
-        return ProviderResult(
-            rows, number(data.get("remaining")), timestamp(data.get("last_record"))
+        remaining = number(data.get("remaining"))
+        # These two upstream backends explicitly fetch a current balance apart
+        # from their usage history. last_record describes usage, not that balance.
+        # SIMS remains tied to its actual meter timestamp; no fabricated freshness.
+        observed = (
+            local_now() if direct and remaining is not None else timestamp(data.get("last_record"))
         )
+        self.logger.debug(
+            "iotun: balance_present=%s balance_origin=%s observed_at=%s history_at=%s rows=%s",
+            remaining is not None,
+            "live" if direct else "meter",
+            observed,
+            timestamp(data.get("last_record")),
+            len(rows),
+        )
+        return ProviderResult(rows, remaining, observed)
