@@ -1,14 +1,106 @@
-# astrbot-plugin-helloworld
+# SZU Helper
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+AstrBot 深圳大学宿舍用电插件：宿舍绑定、Base16384 配置分享、用电查询和每日低电量提醒。支持群聊与私聊，无需 LLM。
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+## 安装与配置
 
-# Supports
+需要 **Python 3.12+、AstrBot 4.16 至 4.x**。在 AstrBot 插件管理中通过本仓库地址安装，依赖由 `requirements.txt` 安装。
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+在插件后台设置下列选项，保存并重载插件后生效：
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `data_source` | `official` | `official` 为学校官方内网接口；`iotun` 为 iotun.com 公网后端。不会自动切换 |
+| `daily_check_enabled` | `true` | 每日检查绑定宿舍的电量 |
+| `low_power_threshold` | `5.0` | 低电量提醒阈值，单位为度；大于 0，支持小数 |
+| `daily_check_time` | `08:00` | 北京时间，严格使用 24 小时制 `HH:mm` |
+
+官方模式要求 **AstrBot 所在机器**能够访问 `http://192.168.84.3:9090` 和 `http://172.25.100.105:8010`。程序默认直连，不继承环境代理。机器人部署在校外时，可在后台选择 `iotun`。公网服务的可用性取决于该服务本身。
+
+## 使用
+
+命令示例中的 `/` 遵循 AstrBot 的唤醒前缀设置。
+
+| 命令 | 功能 |
+| --- | --- |
+| `/绑定宿舍` | 按编号选择校区、宿舍区域、楼栋，再输入宿舍号 |
+| `/绑定宿舍 <配置码>` | 导入 Base16384 宿舍配置 |
+| `/导出宿舍` | 返回纯 Base16384 分享码 |
+| `/用电` | 剩余电量、折算余额、预计可用天数 |
+| `/用电 详情` | 增加日均用电、31 天周期用电、有效天数与数据来源 |
+| `/解绑宿舍` | 解除当前会话中自己的绑定和提醒订阅 |
+| `/发送低电量预警` | 仅 AstrBot 管理员可用：手动检查全部绑定宿舍并发送一次低电量预警 |
+
+绑定按“平台实例＋会话＋发送人”隔离：你可以在两个群分别绑定不同宿舍，私聊绑定也独立。一个群内其他人的绑定不会覆盖你的配置。失败、取消或超时保留旧绑定。
+
+选择时回复数字编号；楼栋每页 15 项，可回复 `上一页`、`下一页`、`返回`、`取消`。每步等待 120 秒。再次发送绑定命令会替换旧流程。宿舍号按文本保存，保留前导零。
+
+目录沿用 Your SZU Life 的“校区 → 宿舍区域 → 楼栋 → 宿舍号”：北校区（粤海）、南校区（沧海）、西丽校区（丽湖），包含粤海宿舍、新斋区、沧海宿舍、丽湖宿舍、丽湖二期五个区域。iotun 的“粤海新宿舍”九栋会映射回原有 SIMS 楼栋，不新增分类。
+
+分享码兼容 Your SZU Life 的 v1 格式：Base16384 编码的 UTF-8 JSON，包含 `version` 和 `location`；后者含 `campusId`、`areaId`、`buildingId`、`buildingName`、`roomName`。支持带 `base16384:` 前缀导入。分享码只编码宿舍配置，不包含发送人或提醒状态；它是编码而非加密。
+
+两端可直接互通：将 Your SZU Life 导出的码作为 `/绑定宿舍` 的参数；将 `/导出宿舍` 返回的纯配置码直接粘贴到 Your SZU Life 的导入框。插件接受的可选 `base16384:` 前缀不是分享协议的一部分，向参考项目导入时请使用纯配置码。
+
+## 查询与提醒规则
+
+- 固定 **0.61 元/度**折算，折算值不代表学校充值账户的实时现金余额。
+- 极简查询及每日检查只取最近 3 个自然日；详情取最近 31 个自然日。官方请求按每段最多 20 天拆分。
+- iotun 使用 `days=3` 或 `days=31`。插件只处理相应时间窗口；第三方服务器可能在内部额外请求历史记录，插件无法控制。
+- 累计电表仅在日期相邻时计算日用量；缺失、计量重置、异常数据不补零。周期用电合计和日均只使用有效日用量。SIMS 的首日是差分基准，因此 31 天窗口最多产生 30 天有效用量。
+- 预计天数按最近 3 天窗口内的有效日均计算。数据不足、日均为零，或余额读数早于昨天时不预测；过期数据明确标注。
+- 每次检查将所有会话的相同宿舍合并查询，最多同时查询 3 个宿舍。再按会话分组，一条消息提及该宿舍所有尚未被提醒的绑定用户。
+- **低于配置阈值**提醒一次（默认 5 度）；持续不足不重复提醒。每日检查检测到恢复至 **阈值及以上**后允许下次不足时再次提醒。新绑定用户在下一轮获得自己的首次提醒。
+- 修改阈值并重载后，在下一次每日检查时按新阈值判断；若宿舍仍处于低电量状态，保留已提醒记录，不因改配置重复通知。
+- 正常重启、重载和重复绑定同一宿舍不会重置提醒记录。解绑或换宿舍后不再接受旧绑定的提醒。
+- 查询失败、过期数据、发送失败不记为已提醒；下一次每日检查可重试。启动不补发错过的每日任务，普通查询不发送主动提醒。
+
+### 管理员手动预警
+
+`/发送低电量预警` 只允许 AstrBot 管理员执行，无需参数。命令检查**所有会话的绑定宿舍**，同宿舍合并为一次最近 3 天查询，再在各绑定会话中发送预警，并向管理员汇总检查、发送和失败数量。
+
+手动检查仍遵守当前低电量阈值和读数有效性；电量充足、读数过期或查询失败时不会发送低电量消息。此前自动任务已提醒过的用户也可收到这次手动预警。每次手动执行独立计数，同时只接受一轮手动检查。
+
+手动检查不读取或修改自动预警的低电量状态及发送记录，不调整定时任务或下一次执行时间。关闭定时任务时仍可使用；手动发送也不会消耗下一次自动提醒。发送前仍检查当前绑定，已解绑或换宿舍的旧绑定不会被通知。
+
+群内提及使用 AstrBot 通用 `At` 组件；不支持提及的平台使用名字，私聊发送普通消息。QQ 官方 API、WebChat 不支持本插件使用的主动推送接口，仍可手动查询。其他平台还需机器人具备发消息权限。
+
+发送记录在平台调用无异常并返回成功后保存。平台无法提供端到端幂等确认时，进程恰好在发送成功与记录落库之间崩溃，可能导致下次重复提醒；正常重启有持久化去重。
+
+## 数据存储
+
+绑定、目录缓存和提醒记录保存在 AstrBot 根目录的 `data/plugin_data/astrbot_plugin_szu_helper/electricity.sqlite3`，不写入插件安装目录。目录缓存按数据源区分，24 小时刷新。切换数据源不改变宿舍身份、分享码及提醒状态。
+
+本插件只查询用电，不办理充值，不查询充值明细，不保存校园账号或密码。日志不输出分享码、用户会话或宿舍查询内容。
+
+## 开发验证
+
+```sh
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r requirements.txt -r requirements-dev.txt
+.venv/bin/python -m pytest -q
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
+```
+
+普通测试使用模拟 HTTP 和临时数据库。安装 `astrbot==4.16.0` 后，`tests/test_astrbot.py` 会额外使用真实 AstrBot 会话代理、配置和消息类型测试；未安装时明确跳过此文件。`tests/smoke_loader.py` 可在隔离目录中验证真实 PluginManager 加载、配置保存、重载和卸载。
+
+在线查询与真实平台消息发送应单独验收；模拟发送成功不等于真实群聊已收到消息。
+
+### 与参考项目的分享兼容验证
+
+```sh
+.venv/bin/python tests/verify_reference_sharing.py --reference-root /path/to/your-szu-life
+```
+
+此脚本在临时 Cargo 项目中直接编译参考项目当前的 `sharing.rs`，使用其实际宿舍结构体及 serde 属性，对五个区域、12 组配置验证 Python → Rust 与 Rust → Python 的编解码及目录校验。不会修改参考项目。需要 Cargo 和已缓存的 `base16384 0.1.0`、`serde`、`serde_json` 依赖。
+
+已验证的源文件哈希和测试向量保存在 `tests/fixtures/reference-share-v1.json`，常规测试会继续核对这些向量。仅用于测试的宿舍号未关联任何用户绑定。
+
+## 参考与许可
+
+- [AstrBot 插件开发文档](https://github.com/AstrBotDevs/AstrBot/tree/master/docs/zh/dev/star)
+- [ElectrifySZU](https://github.com/jinqKing/ElectrifySZU) 与 [iotun.com](https://www.iotun.com/)：功能、公开 API 和楼栋映射参考。
+- [Your SZU Life](https://github.com/rinnein/your-szu-life)：官方门户流程、宿舍分类、分享协议和统计规则参考。
+- [base16384-rs](https://github.com/Wybxc/base16384-rs) 与 [pybase16384](https://github.com/synodriver/pybase16384)：兼容的 Base16384 编解码。
+
+本插件保留 AGPL-3.0 许可证。参考代码的 MIT 许可与归属见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

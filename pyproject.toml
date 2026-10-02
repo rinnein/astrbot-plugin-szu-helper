@@ -1,0 +1,21 @@
+[project]
+name = "astrbot-plugin-szu-helper"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.ruff.lint.per-file-ignores]
+# The integration environment must be isolated before importing AstrBot.
+"tests/test_astrbot.py" = ["E402"]
+"tests/conftest.py" = ["E402"]
+"tests/verify_reference_sharing.py" = ["E402"]

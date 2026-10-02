@@ -1,0 +1,27 @@
+{
+  "data_source": {
+    "description": "电费数据源",
+    "type": "string",
+    "options": ["official", "iotun"],
+    "default": "official",
+    "hint": "official 直连学校内网，需要部署网络可达；iotun 使用第三方公网服务。不会自动切换。保存后重载插件生效。"
+  },
+  "daily_check_enabled": {
+    "description": "启用每日低电量检查",
+    "type": "bool",
+    "default": true,
+    "hint": "同宿舍合并查询；低于配置阈值时提醒一次，检测到恢复至阈值及以上后允许再次提醒。"
+  },
+  "low_power_threshold": {
+    "description": "低电量提醒阈值（度）",
+    "type": "float",
+    "default": 5.0,
+    "hint": "大于 0 的数值，支持小数，例如 7.5。剩余电量低于此值时提醒，达到或超过此值时解除提醒抑制。保存后重载插件生效。"
+  },
+  "daily_check_time": {
+    "description": "每日检查时间（北京时间）",
+    "type": "string",
+    "default": "00:00",
+    "hint": "24 小时制 HH:mm，例如 08:00 或 21:30。时区固定 Asia/Shanghai；启动不补发错过的检查。保存后重载插件生效。"
+  }
+}

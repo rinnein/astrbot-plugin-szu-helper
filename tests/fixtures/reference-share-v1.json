@@ -1,0 +1,128 @@
+{
+  "reference": "your-szu-life",
+  "sharing_sha256": "7c3609d3cbeb4fd40e6d3ed494bb8474236cfc6f76f62cbb918fb2c32101b34b",
+  "location_definition_sha256": "6573a5a5d059ac5fe0874bea12a0ef043d6642c95748777b7f66b54a37a8008f",
+  "base16384_rust_version": "0.1.0",
+  "vectors": [
+    {
+      "code": "泈畦揉腩槛瀣盄稢椛萶发睯榈熧窉煡楜啗嬥爢岈疗掕癡案烂垅聥晒摂囨灹歙撆厤筭晚擢嚰灢歚擆徥籧恙倣皈茴嚋倦埕睬朚擦欹潭杈熢妖羱蠣奮桚夢夈甦讽筎晛摒囨瀰完儒埵謀㴆",
+      "location": {
+        "areaId": "yuehai-main",
+        "buildingId": "54",
+        "buildingName": "山茶斋",
+        "campusId": "yuehai",
+        "roomName": "0601"
+      }
+    },
+    {
+      "code": "泈畦揉腩槛瀣盄稢椛萶发睯榈熧窉煡楜啗嬥爢岈疗掕癡案烂垅聥晒摂囨灹歙撆厤筸桛疦澅眢夈琧接穤桛瑴玐瀺嚍脓囘瀬嚘畖玱物榙苦厵猢岈粚尻璧爹睨窈稢檛蓶茹潭杈熢囀蘰婈痗舀㴄",
+      "location": {
+        "areaId": "yuehai-xinzhai",
+        "buildingId": "7126",
+        "buildingName": "风槐斋",
+        "campusId": "yuehai",
+        "roomName": "0801"
+      }
+    },
+    {
+      "code": "泈畦揉腩槛瀣盄稢椛萶发睯榈熧窉煡楜啗嬥爢岈琶厹畨晚怢纉潲杘抖庈蠢曘擦殡潩奛搖玸瀬嚘畖玱物榙芖庈蠢宎关抈稢暝撖羑睮染琖莔瀺嚹瞊斞窛嫋憎梖訢夈甦讽筎晛摒囨瀰孌儒埵謀㴆",
+      "location": {
+        "areaId": "canghai-main",
+        "buildingId": "6875",
+        "buildingName": "春笛3-8楼",
+        "campusId": "canghai",
+        "roomName": "0501"
+      }
+    },
+    {
+      "code": "泈畦揉腩槛瀣盄稢椛萶发睯榈熧窉煡楜啗嬥爢岈疆玱眢夈琗垕潉月熢埡睬桋擖厥簢夈琧接穤桛瑴玐瀺嚌愃仔蔢夈琧接穤桛瑴螅筥嚎瀤喚溋表蛮惾濥祤倢纉聯槛拦厵猢岈焃櫀缢浟帀㴂",
+      "location": {
+        "areaId": "xili-main",
+        "buildingId": "10057",
+        "buildingName": "A栋风信子",
+        "campusId": "xili",
+        "roomName": "0701"
+      }
+    },
+    {
+      "code": "泈畦揉腩槛瀣盄稢椛萶发睯榈熧窉煡楜啗嬥爢岈疆玱眢夈琗垕潉月熢埡睬桋擆玡药奜咆反猲嚋倦埕睬朚擦欥爢岈焃劈稢暝撖羑睮染琖莔瀺嚹砪涚澐螨園嚰灲槛蓔螅筥嚎瀣拀缢浟帀㴂",
+      "location": {
+        "areaId": "xili-lihuo-phase2",
+        "buildingId": "01",
+        "buildingName": "梧桐树",
+        "campusId": "xili",
+        "roomName": "501"
+      }
+    },
+    {
+      "code": "泈畦揉腩槛瀣盄稢椛萶发睯榈熧窉煡楜啗嬥爢岈疗掕癡案烂垅聥晒摂囨灹歙撆厤筭晚擢嚰灢歚擆徥籧恙倣皈茴嚋倦埕睬朚擦欹潭杈熢妖羱蠣奮桚夢夈甦讽筎晛摒囨瀶娌性菴㴅",
+      "location": {
+        "areaId": "yuehai-main",
+        "buildingId": "54",
+        "buildingName": "山茶斋",
+        "campusId": "yuehai",
+        "roomName": "601"
+      }
+    },
+    {
+      "code": "泈畦揉腩槛瀣盄稢椛萶发睯榈熧窉煡楜啗嬥爢岈疗掕癡案烂垅聥晒摂囨灹歙撆厤筭晚擢嚰灢歚擆徥籧恙倣皈茴嚋倦埕睬朚擦欹潭杈熢妖羱蠣奮桚夢夈甦讽筎晛摒囨瀰完儒埵謀㴆",
+      "location": {
+        "areaId": "yuehai-main",
+        "buildingId": "54",
+        "buildingName": "山茶斋",
+        "campusId": "yuehai",
+        "roomName": "0601"
+      }
+    },
+    {
+      "code": "泈畦揉腩槛瀣盄稢椛萶发睯榈熧窉煡楜啗嬥爢岈疗掕癡案烂垅聥晒摂囨灹歙撆厤筭晚擢嚰灢歚擆徥籧恙倣皈茴嚋倦埕睬朚擦欹潭杈熢妖羱蠣奮桚夢夈甦讽筎晛摒囨瀰娍焃劉譽",
+      "location": {
+        "areaId": "yuehai-main",
+        "buildingId": "54",
+        "buildingName": "山茶斋",
+        "campusId": "yuehai",
+        "roomName": "00601"
+      }
+    },
+    {
+      "code": "泈畦揉腩槛瀣盄稢椛萶发睯榈熧窉煡楜啗嬥爢岈疗掕癡案烂垅聥晒摂囨灹歙撆厤筭晚擢嚰灢歚擆徥籧恙倣皈茴嚋倦埕睬朚擦欹潭杈熢妖羱蠣奮桚夢夈甦讽筎晛摒囨瀰娌兣仄災浀㴁",
+      "location": {
+        "areaId": "yuehai-main",
+        "buildingId": "54",
+        "buildingName": "山茶斋",
+        "campusId": "yuehai",
+        "roomName": "000601"
+      }
+    },
+    {
+      "code": "泈畦揉腩槛瀣盄稢椛萶发睯榈熧窉煡楜啗嬥爢岈疗掕癡案烂垅聥晒摂囨灹歙撆厤筭晚擢嚰灢歚擆徥籧恙倣皈茴嚋倦埕睬朚擦欹潭杈熢妖羱蠣奮桚夢夈甦讽筎晛摒囨瀰娌儃曀缢浟帀㴂",
+      "location": {
+        "areaId": "yuehai-main",
+        "buildingId": "54",
+        "buildingName": "山茶斋",
+        "campusId": "yuehai",
+        "roomName": "0000601"
+      }
+    },
+    {
+      "code": "泈畦揉腩槛瀣盄稢椛萶发睯榈熧窉煡楜啗嬥爢岈疗掕癡案烂垅聥晒摂囨灹歙撆厤筭晚擢嚰灢歚擆徥籧恙倣皈茴嚋倦埕睬朚擦欹潭杈熢妖羱蠣奮桚夢夈甦讽筎晛摒囨瀰娌儃付縱嚟旐㴃",
+      "location": {
+        "areaId": "yuehai-main",
+        "buildingId": "54",
+        "buildingName": "山茶斋",
+        "campusId": "yuehai",
+        "roomName": "00000601"
+      }
+    },
+    {
+      "code": "泈畦揉腩槛瀣盄稢椛萶发睯榈熧窉煡楜啗嬥爢岈疗掕癡案烂垅聥晒摂囨灹歙撆厤筭晚擢嚰灢歚擆徥籧恙倣皈茴嚋倦埕睬朚擦欹潭杈熢妖羱蠣奮桚夢夈甦讽筎晛摒囨瀰娌儃什萰婈痗舀㴄",
+      "location": {
+        "areaId": "yuehai-main",
+        "buildingId": "54",
+        "buildingName": "山茶斋",
+        "campusId": "yuehai",
+        "roomName": "000000601"
+      }
+    }
+  ]
+}
