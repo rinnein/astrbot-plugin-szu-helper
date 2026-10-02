@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 from collections import defaultdict
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from apscheduler.triggers.cron import CronTrigger
 from astrbot.api import AstrBotConfig
 from astrbot.api import logger as astrbot_logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import At, Plain
+from astrbot.api.message_components import At, Plain, Reply
 from astrbot.api.star import Context, Star
 from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -21,12 +22,13 @@ from .szu_electricity.conversation import ReuseSelection, Selection
 from .szu_electricity.models import SHANGHAI, Binding, ElectricityError, Location, Report
 from .szu_electricity.monitor import Monitor
 from .szu_electricity.providers import IotunProvider, OfficialProvider
+from .szu_electricity.qq_messages import mention as qq_mention
+from .szu_electricity.qq_messages import reply as qq_reply
 from .szu_electricity.service import ElectricityService
 from .szu_electricity.sharing import decode, encode
 from .szu_electricity.storage import Store
 
 COMMANDS = {"绑定宿舍", "导出宿舍", "用电", "解绑宿舍", "发送低电量预警"}
-MENTION_PLATFORMS = {"aiocqhttp", "telegram", "discord", "slack", "lark", "dingtalk"}
 
 
 class SenderSessionFilter(SessionFilter):
@@ -142,17 +144,23 @@ class SzuHelperPlugin(Star):
     def _mention(platform: str, is_group: bool, sender_id: str, name: str):
         if not is_group or not sender_id:
             return []
-        if platform in MENTION_PLATFORMS:
-            return [At(qq=sender_id, name=name), Plain("\n")]
-        return [Plain(f"{name or sender_id}\n")]
+        if platform == "qq_official":
+            return [Plain(qq_mention(sender_id) + "\n")]
+        return [At(qq=sender_id, name=name), Plain("\n")]
 
     async def _reply(self, event: AstrMessageEvent, text: str):
+        if event.get_platform_name() == "qq_official":
+            await qq_reply(event, text, self.logger)
+            return
         chain = self._mention(
             event.get_platform_name(),
             bool(event.get_group_id()),
             event.get_sender_id(),
             event.get_sender_name(),
         )
+        message_id = getattr(event.message_obj, "message_id", None)
+        if message_id:
+            chain.insert(0, Reply(id=message_id))
         # Keep the payload in its own Plain component, including share codes.
         await event.send(MessageChain([*chain, Plain(text)]))
 
@@ -384,12 +392,12 @@ class SzuHelperPlugin(Star):
             chain.extend(
                 self._mention(platform, binding.is_group, binding.sender_id, binding.sender_name)
             )
-        chain.append(
-            Plain(
-                f"宿舍 {report.location.buildingName} {report.location.roomName} 剩余电量 {fmt(report.remaining)} 度，低于 {self.monitor.threshold:g} 度，请及时充值。"
-            )
-        )
-        sent = await self.context.send_message(bindings[0].origin, MessageChain(chain))
+        text = f"宿舍 {report.location.buildingName} {report.location.roomName} 剩余电量 {fmt(report.remaining)} 度，低于 {self.monitor.threshold:g} 度，请及时充值。"
+        chain.append(Plain(html.escape(text, quote=False) if platform == "qq_official" else text))
+        message = MessageChain(chain)
+        if platform == "qq_official":
+            message.use_markdown_ = False
+        sent = await self.context.send_message(bindings[0].origin, message)
         if not sent:
             raise ElectricityError("主动发送时未找到目标平台实例，请检查机器人连接状态。")
         self.logger.info(

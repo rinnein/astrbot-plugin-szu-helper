@@ -49,6 +49,7 @@ class Event(AstrMessageEvent):
         msg.sender = MessageMember(user_id=sender, nickname="User" + sender)
         msg.group_id = group
         msg.message = []
+        msg.message_id = "incoming-message-id"
         super().__init__(
             text, msg, PlatformMetadata("aiocqhttp", "Test", id=platform), group or sender
         )
@@ -59,7 +60,9 @@ class Event(AstrMessageEvent):
         self.sent.append(message)
 
     def output(self):
-        return "\n".join(c.text for m in self.sent for c in m.chain if hasattr(c, "text"))
+        return "\n".join(
+            c.text for m in self.sent for c in m.chain if isinstance(c, plugin_module.Plain)
+        )
 
 
 @pytest.fixture
@@ -702,7 +705,7 @@ async def test_qqofficial_428_real_adapter_sends_group_and_private_alerts(
     adapter = object.__new__(QQOfficialPlatformAdapter)
     adapter.config = {"id": "qq-main"}
     adapter.client = SimpleNamespace(api=api)
-    adapter.use_markdown_default = False
+    adapter.use_markdown_default = True  # Plugin must force content mode for native mentions.
     adapter._session_last_message_id = {}
     adapter._session_scene = {"group-openid": "group"}
     adapter._allow_group_proactive_send = True
@@ -730,6 +733,9 @@ async def test_qqofficial_428_real_adapter_sends_group_and_private_alerts(
     assert result.send_errors == []
     assert [kind for kind, _ in calls] == ["group", "private"]
     assert calls[0][1]["group_openid"] == "group-openid"
+    assert "<@member-one>" in calls[0][1]["content"]
+    assert "<@member-two>" in calls[0][1]["content"]
+    assert all(payload.get("markdown") is None for _, payload in calls)
     assert "msg_id" not in calls[0][1]  # true proactive group send, no cached incoming message
     assert all("低于 5 度" in payload["content"] for _, payload in calls)
     assert await plugin.store._all("SELECT * FROM deliveries") == []
@@ -779,3 +785,131 @@ async def test_missing_delivery_platform_is_explained(plugin, location):
     plugin.service.query = query
     result = await plugin.monitor.run_manual()
     assert result.send_failures == 1 and "平台实例已不可用" in result.message()
+
+
+async def make_qq_incoming(api, scene="group", quote_index="REFIDX_this-message=="):
+    from astrbot.core.platform.sources.qqofficial.qqofficial_message_event import (
+        QQOfficialMessageEvent,
+    )
+    from astrbot.core.platform.sources.qqofficial.qqofficial_platform_adapter import (
+        PatchedC2CMessage,
+        PatchedGroupMessage,
+        QQOfficialPlatformAdapter,
+    )
+
+    data = {
+        "id": "ROBOT-command-token",
+        "author": {
+            "id": "author-id",
+            "member_openid": "member-openid",
+            "user_openid": "user-openid",
+            "username": "DISPLAY_NAME_NOT_A_MENTION",
+        },
+        "group_openid": "group-openid",
+        "content": "/用电",
+        "message_scene": {
+            "ext": ["ref_msg_idx=REFIDX_previous-message==", "auth_token=DO_NOT_FORWARD_THIS_TOKEN"]
+        },
+    }
+    if quote_index:
+        data["message_scene"]["ext"].append("msg_idx=" + quote_index)
+    source = (PatchedGroupMessage if scene == "group" else PatchedC2CMessage)(api, "event-id", data)
+    message_type = MessageType.GROUP_MESSAGE if scene == "group" else MessageType.FRIEND_MESSAGE
+    message = await QQOfficialPlatformAdapter._parse_from_qqofficial(source, message_type)
+    session = "group-openid" if scene == "group" else "user-openid"
+    if scene == "group":
+        message.group_id = session
+    return QQOfficialMessageEvent(
+        "用电",
+        message,
+        PlatformMetadata("qq_official", "QQ", id="qq-main"),
+        session,
+        SimpleNamespace(api=api),
+    )
+
+
+@pytest.mark.parametrize("scene", ["group", "private"])
+async def test_qq_native_reply_quotes_own_message_and_uses_real_mention(plugin, monkeypatch, scene):
+    monkeypatch.setenv("ASTRBOT_DISABLE_METRICS", "1")
+    calls = []
+
+    class API:
+        async def post_group_message(self, **payload):
+            calls.append(payload)
+            return {"id": "response-1"}
+
+        async def post_c2c_message(self, **payload):
+            calls.append(payload)
+            return {"id": "response-1"}
+
+    event = await make_qq_incoming(API(), scene)
+    await plugin._reply(event, "剩余电量 88 度")
+    await plugin._reply(event, "第二条回复")
+    assert len(calls) == 2
+    assert all(p["message_reference"] == {"message_id": "REFIDX_this-message=="} for p in calls)
+    assert all(p["msg_id"] == "ROBOT-command-token" and p["msg_type"] == 0 for p in calls)
+    assert calls[0]["msg_seq"] != calls[1]["msg_seq"]
+    assert all("markdown" not in p for p in calls)
+    if scene == "group":
+        assert calls[0]["content"].startswith("<@member-openid>\n")
+        assert calls[0]["group_openid"] == "group-openid"
+    else:
+        assert calls[0]["content"] == "剩余电量 88 度"
+        assert calls[0]["openid"] == "user-openid"
+    serialized = json.dumps(calls)
+    assert "DISPLAY_NAME_NOT_A_MENTION" not in serialized
+    assert "previous-message" not in serialized and "DO_NOT_FORWARD_THIS_TOKEN" not in serialized
+    assert event._has_send_oper
+
+
+async def test_qq_missing_quote_index_keeps_native_mention_and_safe_text(plugin, monkeypatch):
+    monkeypatch.setenv("ASTRBOT_DISABLE_METRICS", "1")
+    calls = []
+
+    class API:
+        async def post_group_message(self, **payload):
+            calls.append(payload)
+            return {"id": "response-1"}
+
+    event = await make_qq_incoming(API(), quote_index=None)
+    await plugin._reply(event, "正文中的 <@other-id> & 字符")
+    assert "message_reference" not in calls[0]
+    assert calls[0]["content"] == "<@member-openid>\n正文中的 &lt;@other-id&gt; &amp; 字符"
+
+
+async def test_qq_expired_passive_reply_preserves_quote_and_mention(plugin, monkeypatch):
+    import botpy.errors
+
+    monkeypatch.setenv("ASTRBOT_DISABLE_METRICS", "1")
+    calls = []
+
+    class API:
+        async def post_group_message(self, **payload):
+            calls.append(payload)
+            if len(calls) == 1:
+                raise botpy.errors.ForbiddenError("expired msg_id")
+            return {"id": "response-1"}
+
+    event = await make_qq_incoming(API())
+    await plugin._reply(event, "回复")
+    assert len(calls) == 2 and "msg_id" not in calls[1]
+    assert calls[1]["message_reference"] == {"message_id": "REFIDX_this-message=="}
+    assert calls[1]["content"].startswith("<@member-openid>")
+
+
+async def test_generic_reply_quotes_incoming_command_not_its_reference(plugin):
+    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+        AiocqhttpMessageEvent,
+    )
+
+    event = Event("用电")
+    event.message_obj.message_id = "this-command"
+    event.message_obj.message = [plugin_module.Reply(id="earlier-message")]
+    await plugin.electricity(event)
+    chain = event.sent[0].chain
+    assert isinstance(chain[0], plugin_module.Reply)
+    assert chain[0].id == "this-command"
+    assert mentioned_ids(event.sent[0]) == ["1"]
+    payload = await AiocqhttpMessageEvent._parse_onebot_json(event.sent[0])
+    assert payload[0] == {"type": "reply", "data": {"id": "this-command"}}
+    assert payload[1] == {"type": "at", "data": {"qq": "1"}}
