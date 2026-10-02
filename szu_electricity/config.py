@@ -12,6 +12,7 @@ class Settings:
     hour: int
     minute: int
     low_power_threshold: float
+    detail_layout: str = "table"
 
     @classmethod
     def parse(cls, config):
@@ -19,6 +20,9 @@ class Settings:
         enabled = config.get("daily_check_enabled", True)
         time = config.get("daily_check_time", "08:00")
         threshold = config.get("low_power_threshold", DEFAULT_LOW_POWER_THRESHOLD)
+        detail_layout = config.get("detail_layout", "table")
+        if detail_layout not in ("table", "list"):
+            raise ElectricityError("detail_layout 必须为 table 或 list。")
         if source not in ("official", "iotun"):
             raise ElectricityError("data_source 必须为 official 或 iotun。")
         if not isinstance(enabled, bool):
@@ -33,4 +37,4 @@ class Settings:
         if not isinstance(time, str) or not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", time):
             raise ElectricityError("daily_check_time 必须使用 24 小时制 HH:mm，例如 08:00。")
         hour, minute = map(int, time.split(":"))
-        return cls(source, enabled, hour, minute, float(threshold))
+        return cls(source, enabled, hour, minute, float(threshold), detail_layout)

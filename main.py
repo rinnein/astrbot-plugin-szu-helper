@@ -14,14 +14,23 @@ from astrbot.api.message_components import At, Plain, Reply
 from astrbot.api.star import Context, Star
 from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
-from astrbot.core.utils.session_waiter import SessionController, SessionFilter, session_waiter
+from astrbot.core.utils.session_waiter import (
+    FILTERS,
+    USER_SESSIONS,
+    SessionController,
+    SessionFilter,
+    SessionWaiter,
+)
 
 from .szu_electricity.analytics import fmt, render
 from .szu_electricity.config import Settings
 from .szu_electricity.conversation import ReuseSelection, Selection
 from .szu_electricity.models import SHANGHAI, Binding, ElectricityError, Location, Report
 from .szu_electricity.monitor import Monitor
+from .szu_electricity.presentation import detail_view
 from .szu_electricity.providers import IotunProvider, OfficialProvider
+from .szu_electricity.qq_interactions import BindingDialog, KeyboardBridge
+from .szu_electricity.qq_messages import MessageRetirer, MessageView
 from .szu_electricity.qq_messages import mention as qq_mention
 from .szu_electricity.qq_messages import reply as qq_reply
 from .szu_electricity.service import ElectricityService
@@ -76,6 +85,8 @@ class SzuHelperPlugin(Star):
         self._flow_locks = defaultdict(asyncio.Lock)
         self._commands: set[asyncio.Task] = set()
         self._ready = False
+        self.keyboard = KeyboardBridge(context, self.logger)
+        self.retirer = MessageRetirer(self.logger)
 
     async def initialize(self):
         settings = Settings.parse(self.config)
@@ -106,6 +117,7 @@ class SzuHelperPlugin(Star):
             )
         self.scheduler.start()
         self._ready = True
+        self.keyboard.attach_platforms()
         self.logger.info(
             "SZU 插件就绪 source=%s daily_check=%s time=%02d:%02d threshold=%g",
             settings.source,
@@ -117,6 +129,7 @@ class SzuHelperPlugin(Star):
 
     async def terminate(self):
         self._ready = False
+        await self.keyboard.close()
         if self.scheduler and self.scheduler.running:
             self.scheduler.shutdown(wait=False)
         tasks = list(self._flows.values()) + list(self._commands)
@@ -124,12 +137,17 @@ class SzuHelperPlugin(Star):
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._flows.clear()
+        await self.retirer.close()
         if self.monitor:
             await self.monitor.close()
         if self.service:
             await self.service.close()
         await self.store.close()
         self.logger.info("SZU 插件已停止，任务及数据库连接已关闭")
+
+    @filter.on_platform_loaded()
+    async def on_platform_loaded(self):
+        self.keyboard.attach_platforms()
 
     @staticmethod
     def _identity(event):
@@ -141,17 +159,18 @@ class SzuHelperPlugin(Star):
         return parts[1].strip() if len(parts) > 1 else ""
 
     @staticmethod
-    def _mention(platform: str, is_group: bool, sender_id: str, name: str):
+    def _mention(platform: str, is_group: bool, sender_id: str, name: str, *, qq_scene=None):
         if not is_group or not sender_id:
             return []
         if platform == "qq_official":
             return [Plain(qq_mention(sender_id) + "\n")]
         return [At(qq=sender_id, name=name), Plain("\n")]
 
-    async def _reply(self, event: AstrMessageEvent, text: str):
+    async def _reply(self, event: AstrMessageEvent, text: str | MessageView, *, interaction=None):
         if event.get_platform_name() == "qq_official":
-            await qq_reply(event, text, self.logger)
-            return
+            return await qq_reply(event, text, self.logger, interaction=interaction)
+        if isinstance(text, MessageView):
+            text = text.text
         chain = self._mention(
             event.get_platform_name(),
             bool(event.get_group_id()),
@@ -199,7 +218,7 @@ class SzuHelperPlugin(Star):
             old.cancel()
             await asyncio.gather(old, return_exceptions=True)
 
-    async def _save(self, event, location: Location):
+    async def _persist_binding(self, event, location: Location):
         await self.store.bind(
             *self._identity(event),
             event.get_sender_name(),
@@ -216,7 +235,10 @@ class SzuHelperPlugin(Star):
         platform = self.context.get_platform_inst(event.get_platform_id())
         if platform is not None and not getattr(platform.meta(), "support_proactive_message", True):
             text += "\n当前平台不支持定时主动推送，仍可使用查询命令。"
-        await self._reply(event, text)
+        return text
+
+    async def _save(self, event, location: Location):
+        return await self._reply(event, await self._persist_binding(event, location))
 
     @filter.command("绑定宿舍")
     async def bind_dorm(self, event: AstrMessageEvent):
@@ -257,48 +279,49 @@ class SzuHelperPlugin(Star):
         await self._select(event, Selection(await self.service.catalog()))
 
     async def _select(self, event, selection: Selection | ReuseSelection):
-        @session_waiter(timeout=120, record_history_chains=False)
+        session_filter = SenderSessionFilter(event)
+        session_id = session_filter.filter(event)
+        session = SessionWaiter(session_filter, session_id, record_history_chains=False)
+        dialog = BindingDialog(
+            event,
+            selection,
+            session.session_controller,
+            self.keyboard,
+            self.retirer,
+            self._reply,
+            self._persist_binding,
+            self.service.catalog,
+            self.logger,
+        )
+
         async def waiter(controller: SessionController, reply: AstrMessageEvent):
-            nonlocal selection
             text = reply.message_str.strip()
             command = text.lstrip("/").split(maxsplit=1)[0] if text else ""
             if command in COMMANDS or text.startswith("/"):
                 return
             reply.stop_event()
-            if text in ("取消", "退出"):
-                controller.stop()
-                await self._reply(reply, "已取消绑定，原配置未变更。")
-                return
-            try:
-                location = selection.accept(text)
-                if controller.future.done():
-                    return
-                if location == "new":
-                    controller.keep(timeout=120, reset_timeout=True)
-                    catalog = await self.service.catalog()
-                    if controller.future.done():
-                        return
-                    selection = Selection(catalog)
-                elif location:
-                    await self._save(reply, location)
-                    controller.stop()
-                    return
-                prompt = selection.prompt()
-            except ElectricityError as exc:
-                prompt = f"{exc}\n{selection.prompt()}"
-            controller.keep(timeout=120, reset_timeout=True)
-            await self._reply(reply, prompt)
+            await dialog.process(text, reply)
 
-        task = asyncio.create_task(waiter(event, session_filter=SenderSessionFilter(event)))
+        # This is the same registration used by AstrBot's session_waiter helper,
+        # retaining the controller so button callbacks can reset its timeout too.
+        FILTERS.append(session_filter)
+        task = asyncio.create_task(session.register_wait(waiter, timeout=120))
         try:
             await asyncio.sleep(0)
-            await self._reply(event, selection.prompt())
+            await dialog.present(event, selection)
             await task
         except TimeoutError:
             await self._reply(event, "绑定已超时，原配置未变更。请重新发送 /绑定宿舍。")
         finally:
+            dialog.close()
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+            if USER_SESSIONS.get(session_id) is session:
+                USER_SESSIONS.pop(session_id, None)
+            if session_filter in FILTERS:
+                FILTERS.remove(session_filter)
+            if session.session_controller.current_event:
+                session.session_controller.current_event.set()
 
     async def _binding(self, event):
         binding = await self.store.get_binding(*self._identity(event))
@@ -326,7 +349,12 @@ class SzuHelperPlugin(Star):
                 raise ElectricityError("用法：/用电 或 /用电 详情。")
             binding = await self._binding(event)
             report = await self.service.query(binding.location, detail=arg == "详情")
-            await self._reply(event, render(report, detail=arg == "详情"))
+            if arg == "详情" and event.get_platform_name() == "qq_official":
+                await self._reply(
+                    event, detail_view(report, Settings.parse(self.config).detail_layout)
+                )
+            else:
+                await self._reply(event, render(report, detail=arg == "详情"))
 
         await self._guard(event, work)
 
@@ -367,6 +395,7 @@ class SzuHelperPlugin(Star):
             raise ElectricityError("绑定的平台实例已不可用，请在目标会话重新绑定宿舍。")
         metadata = adapter.meta()
         platform = metadata.name
+        qq_scene = None
         if not getattr(metadata, "support_proactive_message", True):
             raise ElectricityError(
                 f"当前 {platform} 适配器声明不支持主动消息，请检查 AstrBot 版本及平台配置。"
@@ -380,7 +409,8 @@ class SzuHelperPlugin(Star):
                 session_id = MessageSession.from_str(bindings[0].origin).session_id.rsplit("_", 1)[
                     -1
                 ]
-                proactive_group = scenes.get(session_id) == "group" and getattr(
+                qq_scene = scenes.get(session_id)
+                proactive_group = qq_scene == "group" and getattr(
                     adapter, "_allow_group_proactive_send", False
                 )
                 if not messages.get(session_id) and not proactive_group:
@@ -390,7 +420,13 @@ class SzuHelperPlugin(Star):
         chain = []
         for binding in bindings:
             chain.extend(
-                self._mention(platform, binding.is_group, binding.sender_id, binding.sender_name)
+                self._mention(
+                    platform,
+                    binding.is_group,
+                    binding.sender_id,
+                    binding.sender_name,
+                    qq_scene=qq_scene,
+                )
             )
         text = f"宿舍 {report.location.buildingName} {report.location.roomName} 剩余电量 {fmt(report.remaining)} 度，低于 {self.monitor.threshold:g} 度，请及时充值。"
         chain.append(Plain(html.escape(text, quote=False) if platform == "qq_official" else text))

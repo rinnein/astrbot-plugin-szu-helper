@@ -705,7 +705,7 @@ async def test_qqofficial_428_real_adapter_sends_group_and_private_alerts(
     adapter = object.__new__(QQOfficialPlatformAdapter)
     adapter.config = {"id": "qq-main"}
     adapter.client = SimpleNamespace(api=api)
-    adapter.use_markdown_default = True  # Plugin must force content mode for native mentions.
+    adapter.use_markdown_default = True  # Text warnings must not depend on the adapter default.
     adapter._session_last_message_id = {}
     adapter._session_scene = {"group-openid": "group"}
     adapter._allow_group_proactive_send = True
@@ -733,8 +733,9 @@ async def test_qqofficial_428_real_adapter_sends_group_and_private_alerts(
     assert result.send_errors == []
     assert [kind for kind, _ in calls] == ["group", "private"]
     assert calls[0][1]["group_openid"] == "group-openid"
-    assert "<@member-one>" in calls[0][1]["content"]
-    assert "<@member-two>" in calls[0][1]["content"]
+    assert "<@" not in calls[0][1]["content"]
+    assert '<qqbot-at-user id="member-one" />' in calls[0][1]["content"]
+    assert '<qqbot-at-user id="member-two" />' in calls[0][1]["content"]
     assert all(payload.get("markdown") is None for _, payload in calls)
     assert "msg_id" not in calls[0][1]  # true proactive group send, no cached incoming message
     assert all("低于 5 度" in payload["content"] for _, payload in calls)
@@ -829,7 +830,7 @@ async def make_qq_incoming(api, scene="group", quote_index="REFIDX_this-message=
 
 
 @pytest.mark.parametrize("scene", ["group", "private"])
-async def test_qq_native_reply_quotes_own_message_and_uses_real_mention(plugin, monkeypatch, scene):
+async def test_qq_reply_quotes_own_message_without_fake_group_mentions(plugin, monkeypatch, scene):
     monkeypatch.setenv("ASTRBOT_DISABLE_METRICS", "1")
     calls = []
 
@@ -851,7 +852,7 @@ async def test_qq_native_reply_quotes_own_message_and_uses_real_mention(plugin, 
     assert calls[0]["msg_seq"] != calls[1]["msg_seq"]
     assert all("markdown" not in p for p in calls)
     if scene == "group":
-        assert calls[0]["content"].startswith("<@member-openid>\n")
+        assert calls[0]["content"] == '<qqbot-at-user id="member-openid" />\n剩余电量 88 度'
         assert calls[0]["group_openid"] == "group-openid"
     else:
         assert calls[0]["content"] == "剩余电量 88 度"
@@ -862,7 +863,7 @@ async def test_qq_native_reply_quotes_own_message_and_uses_real_mention(plugin, 
     assert event._has_send_oper
 
 
-async def test_qq_missing_quote_index_keeps_native_mention_and_safe_text(plugin, monkeypatch):
+async def test_qq_missing_quote_index_keeps_safe_text_without_fake_mention(plugin, monkeypatch):
     monkeypatch.setenv("ASTRBOT_DISABLE_METRICS", "1")
     calls = []
 
@@ -874,10 +875,13 @@ async def test_qq_missing_quote_index_keeps_native_mention_and_safe_text(plugin,
     event = await make_qq_incoming(API(), quote_index=None)
     await plugin._reply(event, "正文中的 <@other-id> & 字符")
     assert "message_reference" not in calls[0]
-    assert calls[0]["content"] == "<@member-openid>\n正文中的 &lt;@other-id&gt; &amp; 字符"
+    assert (
+        calls[0]["content"]
+        == '<qqbot-at-user id="member-openid" />\n正文中的 &lt;@other-id&gt; &amp; 字符'
+    )
 
 
-async def test_qq_expired_passive_reply_preserves_quote_and_mention(plugin, monkeypatch):
+async def test_qq_expired_passive_reply_preserves_quote_without_uid_prefix(plugin, monkeypatch):
     import botpy.errors
 
     monkeypatch.setenv("ASTRBOT_DISABLE_METRICS", "1")
@@ -894,7 +898,7 @@ async def test_qq_expired_passive_reply_preserves_quote_and_mention(plugin, monk
     await plugin._reply(event, "回复")
     assert len(calls) == 2 and "msg_id" not in calls[1]
     assert calls[1]["message_reference"] == {"message_id": "REFIDX_this-message=="}
-    assert calls[1]["content"].startswith("<@member-openid>")
+    assert calls[1]["content"] == '<qqbot-at-user id="member-openid" />\n回复'
 
 
 async def test_generic_reply_quotes_incoming_command_not_its_reference(plugin):
@@ -913,3 +917,77 @@ async def test_generic_reply_quotes_incoming_command_not_its_reference(plugin):
     payload = await AiocqhttpMessageEvent._parse_onebot_json(event.sent[0])
     assert payload[0] == {"type": "reply", "data": {"id": "this-command"}}
     assert payload[1] == {"type": "at", "data": {"qq": "1"}}
+
+
+async def test_qq_group_does_not_print_reported_openid_format(plugin, monkeypatch):
+    monkeypatch.setenv("ASTRBOT_DISABLE_METRICS", "1")
+    calls = []
+
+    class API:
+        async def post_group_message(self, **payload):
+            calls.append(payload)
+            return {"id": "response-1"}
+
+    event = await make_qq_incoming(API())
+    opaque_id = "595BD8" + "A" * 20 + "51A276"
+    event.message_obj.sender.user_id = opaque_id
+    await plugin._reply(event, "用电查询结果")
+    assert calls[0]["content"] == f'<qqbot-at-user id="{opaque_id}" />\n用电查询结果'
+    assert "<@" not in calls[0]["content"]
+    assert calls[0]["message_reference"] == {"message_id": "REFIDX_this-message=="}
+    assert (
+        plugin._mention("qq_official", True, opaque_id, "用户名", qq_scene="group")[0].text
+        == f'<qqbot-at-user id="{opaque_id}" />\n'
+    )
+    assert (
+        plugin._mention("qq_official", True, opaque_id, "用户名")[0].text
+        == f'<qqbot-at-user id="{opaque_id}" />\n'
+    )
+
+
+async def test_qq_channel_keeps_documented_channel_mentions(plugin, monkeypatch):
+    import botpy.message
+    from astrbot.core.platform.sources.qqofficial.qqofficial_message_event import (
+        QQOfficialMessageEvent,
+    )
+
+    monkeypatch.setenv("ASTRBOT_DISABLE_METRICS", "1")
+    calls = []
+
+    class API:
+        async def post_message(self, **payload):
+            calls.append(payload)
+            return {"id": "response-1"}
+
+    api = API()
+    raw = botpy.message.Message(
+        api,
+        None,
+        {
+            "id": "channel-command",
+            "channel_id": "123",
+            "author": {"id": "456", "username": "姓名"},
+            "content": "用电",
+        },
+    )
+    message = AstrBotMessage()
+    message.type = MessageType.GROUP_MESSAGE
+    message.group_id = "123"
+    message.sender = MessageMember(user_id="456", nickname="姓名")
+    message.message_id = "channel-command"
+    message.raw_message = raw
+    event = QQOfficialMessageEvent(
+        "用电",
+        message,
+        PlatformMetadata("qq_official", "QQ", id="qq-main"),
+        "123",
+        SimpleNamespace(api=api),
+    )
+    await plugin._reply(event, "查询结果")
+    assert calls[0]["content"] == '<qqbot-at-user id="456" />\n查询结果'
+    assert calls[0]["message_reference"] == {"message_id": "channel-command"}
+    assert "msg_type" not in calls[0]
+    assert (
+        plugin._mention("qq_official", True, "456", "姓名", qq_scene="channel")[0].text
+        == '<qqbot-at-user id="456" />\n'
+    )

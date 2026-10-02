@@ -1,4 +1,11 @@
 {
+  "detail_layout": {
+    "description": "QQ 用电详情排版",
+    "type": "string",
+    "options": ["table", "list"],
+    "default": "table",
+    "hint": "table 使用 Markdown 指标表格；若客户端显示不兼容，可切换 list 指标列表。极简查询仍为短文本。"
+  },
   "data_source": {
     "description": "电费数据源",
     "type": "string",

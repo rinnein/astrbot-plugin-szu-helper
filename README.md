@@ -11,6 +11,7 @@ AstrBot 深圳大学宿舍用电插件：宿舍绑定、Base16384 配置分享�
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `data_source` | `official` | `official` 为学校官方内网接口；`iotun` 为 iotun.com 公网后端。所有网络功能跟随此选项，不会自动切换 |
+| `detail_layout` | `table` | QQ 用电详情使用 Markdown 表格；客户端显示不兼容时可选 `list` 指标列表 |
 | `daily_check_enabled` | `true` | 每日检查绑定宿舍的电量 |
 | `low_power_threshold` | `5.0` | 低电量提醒阈值，单位为度；大于 0，支持小数 |
 | `daily_check_time` | `00:00` | 北京时间，严格使用 24 小时制 `HH:mm` |
@@ -43,7 +44,17 @@ iotun 的 HTTPS 连接超时为 10 秒，响应等待为 30 秒；暂时的网�
 
 复用已有配置不需要网络请求；重新选择时仍从当前配置的数据源加载目录。带配置码的 `/绑定宿舍 <配置码>` 直接按配置码导入，不弹出复用询问。其他用户或其他平台实例的绑定不会出现在复用选项中。
 
-选择时回复数字编号；楼栋每页 15 项，可回复 `上一页`、`下一页`、`返回`、`取消`。每步等待 120 秒。再次发送绑定命令会替换旧流程。宿舍号按文本保存，保留前导零。
+QQ 官方群聊、私聊的选择步骤使用 Markdown 卡片与 keyboard，**单击按钮完成选择**，无需再发送一条选项消息。按钮只允许本次绑定发起人操作，重复点击、旧步骤和其他会话的按钮不会修改绑定。也可继续回复数字编号，按钮与文字共用同一流程。
+
+楼栋每页 15 项；按钮标签过长时缩短显示，卡片内保留完整名称。支持上一页、下一页、返回、取消及复用已有绑定；宿舍号仍手动输入并保留前导零。每步等待 120 秒，再次发送绑定命令会替换旧流程。其他平台保留文字选项。
+
+每步新卡片发送成功后，自动撤回上一张**机器人选项卡**；绑定完成或取消后保留最终结果消息。不撤回用户命令及选择消息。QQ 撤回时限为发送后 2 分钟；超过时限、缺少权限或已撤回只记录日志，不中断绑定。发送失败时保留原菜单，避免用户失去可操作选项。
+
+### QQ 按钮首次启用
+
+插件在启动和平台加载时订阅 `INTERACTION_CREATE`，并接入当前 QQ WebSocket 客户端的回调。若首次安装时 QQ 机器人已连接且尚未订阅互动事件，请在 AstrBot 机器人管理中重连该机器人一次（仅重载插件不能改变已经建立的 WebSocket 订阅）。插件不会强制断开机器人；日志会提示需重连，期间继续提供编号菜单。
+
+若 QQ 账号无自定义 keyboard 权限或接口明确拒绝按钮，会自动降级为 Markdown 编号菜单。Markdown 不可用时继续降级为文字，不会丢失绑定流程。详情默认使用“指标 / 数值”表格，极简查询仍为短文本；QQ 客户端的视觉渲染无法通过 HTTP 响应检测，表格显示异常时请将 `detail_layout` 改为 `list`。
 
 目录沿用 Your SZU Life 的“校区 → 宿舍区域 → 楼栋 → 宿舍号”：北校区（粤海）、南校区（沧海）、西丽校区（丽湖），包含粤海宿舍、新斋区、沧海宿舍、丽湖宿舍、丽湖二期五个区域。iotun 的“粤海新宿舍”九栋会映射回原有 SIMS 楼栋，不新增分类。
 
@@ -73,11 +84,13 @@ iotun 的 HTTPS 连接超时为 10 秒，响应等待为 30 秒；暂时的网�
 
 手动检查不读取或修改自动预警的低电量状态及发送记录，不调整定时任务或下一次执行时间。关闭定时任务时仍可使用；手动发送也不会消耗下一次自动提醒。发送前仍检查当前绑定，已解绑或换宿舍的旧绑定不会被通知。
 
-群聊中的命令回复、绑定对话、错误提示及手动检查回执会 **@ 发起人**；定时/手动批量预警会 **@ 对应宿舍的绑定者**，不会改为 @ 管理员。其他平台使用 AstrBot 通用 `At` 组件；QQ 官方使用成员 OpenID 的原生 `<@成员OpenID>` 格式，并强制以 `content` 文本模式发送，不再用昵称前缀模拟提及。私聊不添加群聊提及，分享码正文保持原编码格式。
+命令回复提及发起人，批量预警提及宿舍绑定者。QQ 官方群聊及频道使用官方最新文本交互协议 **`<qqbot-at-user id="member_openid" />`**，文本和 Markdown 均适用；其他平台使用 AstrBot `At` 组件。旧 `<@userid>` 格式已移除，不以用户名文本冒充提及。私聊不添加群聊提及，分享码仍为原编码正文。
 
-命令回复优先引用触发它的用户消息。其他平台使用 `Reply` 组件；QQ 官方群聊/私聊从原消息 `message_scene.ext` 的 `msg_idx` 读取引用索引，写入 `message_reference.message_id`。这与被动回复参数 `msg_id` 不同，也不会使用指向更早消息的 `ref_msg_idx`。QQ 没有下发引用索引时保留提及与正文，日志会说明缺少引用索引。实现使用 QQ SDK 已有的发送接口，不修改 AstrBot 的全局适配器。
+命令回复优先引用触发它的用户消息。其他平台使用 `Reply` 组件；QQ 官方群聊/私聊从原消息 `message_scene.ext` 的 `msg_idx` 读取引用索引，写入 `message_reference.message_id`。这与被动回复参数 `msg_id`、撤回使用的发送回执 `id` 均不同，也不会使用指向更早消息的 `ref_msg_idx`。QQ 没有下发引用索引时保留正文和提及，日志会说明缺少引用索引。
 
-相关协议说明：[QQ 群消息发送](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html)、[群消息事件与引用索引](https://bot.q.qq.com/wiki/develop/api-v2/autogen/event/group_message_create.html)。主动消息是否可用仍由当前平台适配器的能力声明决定。
+按钮回调仅处理本插件自己的流程标识，保留其他处理器；卸载时解除回调接入。流程及消息回执只存于内存，重载后旧按钮失效，不修改已有宿舍、缓存及预警记录。引用数据中的 `auth_token` 不会被复制、记录或用于按钮数据。
+
+相关协议说明：[QQ 群消息及 keyboard](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html)、[文本交互与新版 @](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/trans/text-chain.html)、[撤回群聊消息](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages_message_id.delete.html)。主动消息是否可用仍由当前平台适配器的能力声明决定。
 
 QQ 官方 WebSocket 机器人支持主动预警（已对照 AstrBot 4.28.2 适配器验证）。按 [QQ 官方 WebSocket 文档](https://docs.astrbot.app/platform/qqofficial/websockets.html) 在 QQ 群的机器人设置中开启“机器人主动在群聊内发言”。旧版适配器若不支持主动消息，会给出明确提示。若重启后 QQ 群/频道发送上下文丢失，请先在目标会话给机器人发一条消息后再试；插件不会将适配器跳过发送误记为成功。
 
@@ -113,9 +126,9 @@ uv pip install --python .venv/bin/python -r requirements.txt -r requirements-dev
 .venv/bin/ruff format --check .
 ```
 
-普通测试使用模拟 HTTP 和临时数据库。安装 `astrbot==4.16.0` 后，`tests/test_astrbot.py` 会额外使用真实 AstrBot 会话代理、配置和消息类型测试；未安装时明确跳过此文件。`tests/smoke_loader.py` 可在隔离目录中验证真实 PluginManager 加载、配置保存、重载和卸载。
+普通测试使用模拟 HTTP 和临时数据库。安装 `astrbot==4.28.2` 后，集成测试会使用真实 AstrBot 会话代理、QQ 适配器、botpy 互动事件分发和消息类型（仅替换最外层网络发送）；未安装时明确跳过集成测试。`tests/smoke_loader.py` 可在隔离目录中验证真实 PluginManager 加载、配置保存、重载和卸载。
 
-在线查询与真实平台消息发送应单独验收；模拟发送成功不等于真实群聊已收到消息。
+在线查询与真实 QQ 客户端应单独验收：新版 @ 是否产生提醒、单击按钮是否跳步、旧菜单是否撤回、Markdown 表格是否正确显示。请求字段和模拟发送成功不等于客户端效果已通过。
 
 ### 与参考项目的分享兼容验证
 

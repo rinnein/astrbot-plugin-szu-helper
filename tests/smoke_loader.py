@@ -38,7 +38,7 @@ async def main():
     meta = next(s for s in star_registry if s.name == "astrbot_plugin_szu_helper")
     old = meta.star_cls
     assert old._ready and len(old.scheduler.get_jobs()) == 1
-    assert len(meta.star_handler_full_names) == 5
+    assert len(meta.star_handler_full_names) == 6
     if hasattr(LogManager, "get_plugin_logger"):
         import logging
 

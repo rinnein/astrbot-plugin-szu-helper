@@ -1,26 +1,29 @@
-"""QQ Official text delivery without losing mentions or message references.
+"""QQ text-chain, Markdown, keyboard and recall support through the QQ SDK."""
 
-AstrBot 4.28.2 ignores generic At/Reply components in its QQ converter. Use
-QQ's content markup and message_reference fields for this plugin's text replies.
-"""
-
+import asyncio
 import html
 import random
+import re
+import time
+from collections import defaultdict
 from collections.abc import Mapping
+from dataclasses import dataclass
+from functools import partial
 
 from .models import ElectricityError
 
 
 def mention(user_id: str) -> str:
-    # IDs come from the adapter's member_openid/user ID, never from a nickname.
-    return f"<@{html.escape(str(user_id), quote=True)}>"
+    return f'<qqbot-at-user id="{html.escape(str(user_id), quote=True)}" />'
+
+
+def escape_markdown(text: str) -> str:
+    text = html.escape(text, quote=False)
+    return re.sub(r"([\\`*_{}\[\]()#+.!|>~-])", r"\\\1", text)
 
 
 def own_reference(source) -> str | None:
-    """Read this incoming message's quote index, not the message it quotes.
-
-    message_scene.ext can also contain auth_token; never forward or log it.
-    """
+    """Only extract this message's msg_idx; never copy auth_token/ref_msg_idx."""
     data = getattr(source, "raw_data", source)
     scene = (
         data.get("message_scene")
@@ -37,65 +40,228 @@ def own_reference(source) -> str | None:
     return None
 
 
-async def reply(event, text: str, logger) -> None:
+@dataclass(frozen=True)
+class MessageView:
+    text: str
+    markdown: str | None = None
+    keyboard: dict | None = None
+    fallback_markdown: str | None = None
+
+
+@dataclass(frozen=True)
+class SentMessage:
+    platform_id: str
+    scene: str
+    peer_id: str
+    message_id: str
+    sent_at: float
+    api: object
+    keyboard: bool = False
+
+
+def _error_code(exc) -> int | None:
+    value = getattr(exc, "msgs", None)
+    if isinstance(value, Mapping):
+        value = value.get("code")
+        return value if isinstance(value, int) else None
+    match = re.search(r'(?:["\']?code["\']?\s*[:=]\s*|错误码\s*[:：]\s*)(\d+)', str(exc), re.I)
+    return int(match.group(1)) if match else None
+
+
+def _rejected_feature(exc, feature: str) -> bool:
+    # Only explicit protocol rejections justify changing the payload. Transport
+    # failures may have delivered it already and must not trigger duplicate sends.
+    if not type(exc).__module__.startswith("botpy.errors"):
+        return False
+    code = _error_code(exc)
+    text = str(exc).lower()
+    if feature == "keyboard":
+        return code in {305007, 40034029} or any(
+            word in text for word in ("keyboard", "button", "按钮", "键盘")
+        )
+    if feature == "markdown":
+        return (
+            code in {304036, 304061, 40034010, 40034011, 40034124, 40034127} or "markdown" in text
+        )
+    if feature == "trigger":
+        return code in {304103, 40034005, 40034024, 40034025, 40034026, 40034128} or (
+            ("msg_id" in text or "event_id" in text)
+            and any(word in text for word in ("expired", "过期", "无效", "越权"))
+        )
+    return False
+
+
+async def reply(event, text: str | MessageView, logger, *, interaction=None) -> SentMessage:
     import botpy.message
     from astrbot.api.event import AstrMessageEvent, MessageChain
     from astrbot.api.message_components import Plain
-    from astrbot.core.platform.sources.qqofficial.qqofficial_message_event import (
-        QQOfficialMessageEvent,
-    )
 
+    view = MessageView(text) if isinstance(text, str) else text
     source = getattr(event.message_obj, "raw_message", None)
     api = event.bot.api
-    body = html.escape(text, quote=False)
-    if event.get_group_id() and event.get_sender_id():
-        body = mention(event.get_sender_id()) + "\n" + body
-    payload = {"content": body}
-    message_id = getattr(event.message_obj, "message_id", None)
-    if message_id:
-        payload["msg_id"] = str(message_id)
-
-    if isinstance(source, (botpy.message.GroupMessage, botpy.message.C2CMessage)):
+    if isinstance(source, botpy.message.GroupMessage):
+        scene, peer = "group", source.group_openid
+        send = partial(api.post_group_message, group_openid=peer)
         reference = own_reference(source)
-        payload["msg_type"] = 0  # Native mentions are content markup, not Markdown.
+    elif isinstance(source, botpy.message.C2CMessage):
+        scene, peer = "c2c", source.author.user_openid
+        send = partial(api.post_c2c_message, openid=peer)
+        reference = own_reference(source)
+    elif isinstance(source, botpy.message.Message):
+        scene, peer = "channel", source.channel_id
+        send = partial(api.post_message, channel_id=peer)
+        reference = getattr(event.message_obj, "message_id", None)
+    elif isinstance(source, botpy.message.DirectMessage):
+        scene, peer = "dm", source.guild_id
+        send = partial(api.post_dms, guild_id=peer)
+        reference = getattr(event.message_obj, "message_id", None)
+    else:
+        raise ElectricityError("QQ 官方回复缺少可识别的原消息上下文。")
+    if not peer:
+        raise ElectricityError("QQ 官方回复缺少目标会话。")
+
+    prefix = (
+        mention(event.get_sender_id()) + "\n"
+        if scene in {"group", "channel"} and event.get_sender_id()
+        else ""
+    )
+    payload = {}
+    if view.markdown is not None:
+        payload["markdown"] = {"content": prefix + view.markdown}
+    else:
+        payload["content"] = prefix + html.escape(view.text, quote=False)
+    if view.keyboard and view.markdown is not None:
+        payload["keyboard"] = view.keyboard
+    if reference:
+        payload["message_reference"] = {"message_id": str(reference)}
+
+    if interaction is not None:
+        event_id = getattr(interaction, "event_id", None)
+        if event_id:
+            payload["event_id"] = event_id
+    else:
+        message_id = getattr(event.message_obj, "message_id", None)
+        if message_id:
+            payload["msg_id"] = str(message_id)
+    if scene in {"group", "c2c"}:
+        payload["msg_type"] = 2 if "markdown" in payload else 0
         sequence = event.get_extra("szu_qq_reply_sequence")
         sequence = random.randint(1, 10000) if sequence is None else sequence % 10000 + 1
         event.set_extra("szu_qq_reply_sequence", sequence)
         payload["msg_seq"] = sequence
-        if isinstance(source, botpy.message.GroupMessage):
 
-            async def send(parameters):
-                return await api.post_group_message(group_openid=source.group_openid, **parameters)
-        else:
-
-            async def send(parameters):
-                return await api.post_c2c_message(openid=source.author.user_openid, **parameters)
-    elif isinstance(source, botpy.message.Message):
-        reference = str(message_id) if message_id else None
-
-        async def send(parameters):
-            return await api.post_message(channel_id=source.channel_id, **parameters)
-    elif isinstance(source, botpy.message.DirectMessage):
-        reference = str(message_id) if message_id else None
-
-        async def send(parameters):
-            return await api.post_dms(guild_id=source.guild_id, **parameters)
+    list_fallback_used = False
+    for _ in range(6):
+        try:
+            sent_at = time.monotonic()
+            result = await send(**payload)
+            break
+        except Exception as exc:
+            if _rejected_feature(exc, "trigger") and ("msg_id" in payload or "event_id" in payload):
+                payload.pop("msg_id", None)
+                payload.pop("event_id", None)
+                logger.warning("QQ 被动回复标识失效，改用主动发送，保留引用")
+            elif "keyboard" in payload and _rejected_feature(exc, "keyboard"):
+                payload.pop("keyboard")
+                logger.warning("QQ keyboard 被拒绝，降级为编号选择")
+            elif "markdown" in payload and _rejected_feature(exc, "markdown"):
+                if view.fallback_markdown and not list_fallback_used:
+                    payload["markdown"] = {"content": prefix + view.fallback_markdown}
+                    list_fallback_used = True
+                    logger.warning("QQ Markdown 排版被拒绝，改用指标列表")
+                else:
+                    payload.pop("markdown")
+                    payload.pop("keyboard", None)
+                    payload["content"] = prefix + html.escape(view.text, quote=False)
+                    if scene in {"group", "c2c"}:
+                        payload["msg_type"] = 0
+                    logger.warning("QQ Markdown 被拒绝，降级为文字消息")
+            else:
+                raise
     else:
-        raise ElectricityError("QQ 官方回复缺少可识别的原消息上下文。")
-
-    if reference:
-        payload["message_reference"] = {"message_id": reference}
-    else:
-        logger.debug("QQ 回复缺少当前消息的引用索引，保留提及并发送正文")
-
-    # Preserve AstrBot's existing fallback for expired passive-reply tokens.
-    # It does not discard the independent quote reference or native mention.
-    fallback = getattr(QQOfficialMessageEvent, "_send_with_markdown_fallback", None)
-    if callable(fallback):
-        await fallback(send_func=send, payload=payload, plain_text=body)
-    else:
-        await send(payload)
-    await AstrMessageEvent.send(event, MessageChain([Plain(body)]))
+        raise ElectricityError("QQ 消息降级发送未成功。")
+    message_id = result.get("id") if isinstance(result, Mapping) else getattr(result, "id", None)
+    if not message_id:
+        raise ElectricityError("QQ 发送接口未返回消息 ID，无法确认消息发送成功。")
+    await AstrMessageEvent.send(event, MessageChain([Plain(view.text)]))
     logger.debug(
-        "QQ 命令回复已发送 quoted=%s mention=%s", bool(reference), bool(event.get_group_id())
+        "QQ 回复已发送 scene=%s quoted=%s markdown=%s keyboard=%s",
+        scene,
+        bool(reference),
+        "markdown" in payload,
+        "keyboard" in payload,
     )
+    return SentMessage(
+        event.get_platform_id(),
+        scene,
+        str(peer),
+        str(message_id),
+        sent_at,
+        api,
+        "keyboard" in payload,
+    )
+
+
+class MessageRetirer:
+    """Recall only our own receipts, within QQ's two-minute time limit."""
+
+    def __init__(self, logger, *, clock=time.monotonic, sleep=asyncio.sleep):
+        self.logger, self.clock, self.sleep = logger, clock, sleep
+        self._locks = defaultdict(asyncio.Lock)
+        self._last = {}
+        self._pending = set()
+        self._tasks = set()
+
+    def schedule(self, receipt: SentMessage | None):
+        if receipt is None or receipt.scene not in {"group", "c2c"}:
+            return
+        key = (receipt.platform_id, receipt.scene, receipt.peer_id, receipt.message_id)
+        if key in self._pending:
+            return
+        self._pending.add(key)
+        task = asyncio.create_task(self._recall(receipt))
+        self._tasks.add(task)
+
+        def done(task):
+            self._pending.discard(key)
+            self._tasks.discard(task)
+            if not task.cancelled():
+                task.exception()
+
+        task.add_done_callback(done)
+
+    async def _recall(self, receipt: SentMessage):
+        from botpy.http import Route
+
+        try:
+            async with self._locks[receipt.platform_id]:
+                delay = 0.125 - (self.clock() - self._last.get(receipt.platform_id, float("-inf")))
+                if delay > 0:
+                    await self.sleep(delay)
+                if not 0 <= self.clock() - receipt.sent_at < 120:
+                    self.logger.debug("跳过超过撤回时限的选项卡")
+                    return
+                self._last[receipt.platform_id] = self.clock()
+                path = (
+                    "/v2/groups/{peer}/messages/{message}"
+                    if receipt.scene == "group"
+                    else "/v2/users/{peer}/messages/{message}"
+                )
+                async with asyncio.timeout(5):
+                    # QQ DELETE returns no body on success; None is successful here.
+                    await receipt.api._http.request(
+                        Route("DELETE", path, peer=receipt.peer_id, message=receipt.message_id)
+                    )
+                self.logger.debug("上一张选项卡已撤回 scene=%s", receipt.scene)
+        except Exception as exc:
+            self.logger.warning(
+                "选项卡撤回失败，不影响绑定流程：%s code=%s", type(exc).__name__, _error_code(exc)
+            )
+
+    async def drain(self):
+        await asyncio.gather(*list(self._tasks), return_exceptions=True)
+
+    async def close(self):
+        for task in list(self._tasks):
+            task.cancel()
+        await self.drain()
