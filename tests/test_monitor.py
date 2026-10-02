@@ -321,3 +321,26 @@ async def test_manual_and_scheduled_runs_are_independent(store, location):
     assert len(sent) == 2  # each requested run delivers independently
     assert len((await automatic_records(store))[1]) == 1
     await service.close()
+
+
+async def test_source_switch_does_not_join_or_relabel_previous_query(store, location):
+    first_started, release = asyncio.Event(), asyncio.Event()
+    official, iotun = Provider(), Provider()
+    iotun.name = "iotun"
+
+    async def wait_for_release():
+        first_started.set()
+        await release.wait()
+
+    official.before = wait_for_release
+    selected = [official]
+    service = ElectricityService(official, store, provider_selector=lambda: selected[0])
+    pending = asyncio.create_task(service.query(location))
+    await first_started.wait()
+    selected[0] = iotun
+    current = await service.query(location)
+    assert current.source == "iotun" and iotun.calls == 1
+    release.set()
+    previous = await pending
+    assert previous.source == "official" and official.calls == 1
+    await service.close()

@@ -4,7 +4,7 @@
     "type": "string",
     "options": ["official", "iotun"],
     "default": "official",
-    "hint": "official 直连学校内网，需要部署网络可达；iotun 使用第三方公网服务。不会自动切换。保存后重载插件生效。"
+    "hint": "official 直连学校内网；iotun 使用公网服务 www.iotun.com。绑定目录、导入校验、用电查询及两类预警均跟随此选项，不会自动切换。保存后用于后续请求。"
   },
   "daily_check_enabled": {
     "description": "启用每日低电量检查",

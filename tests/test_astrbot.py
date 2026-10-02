@@ -140,7 +140,8 @@ async def test_real_timeout_and_cancel_preserve_binding(plugin, location):
 
 async def test_scheduler_schema_reload_and_stop(plugin, tmp_path):
     jobs = plugin.scheduler.get_jobs()
-    assert len(jobs) == 1 and "hour='8'" in str(jobs[0].trigger)
+    hour = plugin_module.Settings.parse(plugin.config).hour
+    assert len(jobs) == 1 and f"hour='{hour}'" in str(jobs[0].trigger)
     assert jobs[0].max_instances == 1
     task = await started(plugin, Event("绑定宿舍"))
     await plugin.terminate()
@@ -278,3 +279,121 @@ async def test_manual_alert_command_bypasses_active_binding_session(plugin):
     assert not task.done()
     await reply(plugin, "取消")
     await task
+
+
+async def test_all_network_features_follow_selected_source(tmp_path, monkeypatch, location):
+    import gzip
+    from datetime import datetime
+    from urllib.parse import parse_qs
+
+    import httpx
+
+    from szu_electricity.providers import IotunProvider, OfficialProvider
+
+    requests = []
+
+    def handler(req):
+        requests.append((req.url.host, req.url.path, dict(req.url.params)))
+        if req.url.host == "www.iotun.com":
+            if req.url.path == "/api/buildings":
+                data = [{"group": "yuehai_sftest", "buildings": [{"id": "03", "name": "山茶斋"}]}]
+            else:
+                assert req.url.path == "/api/status"
+                assert req.url.params["client"] == "yuehai_sftest"
+                date = str(datetime.now(SHANGHAI).date())
+                data = {
+                    "remaining": 4,
+                    "last_record": date,
+                    "trend": [{"date": date, "daily_used_kwh": 2}],
+                }
+            compressed = gzip.compress(json.dumps({"ok": True, "data": data}).encode())
+            return httpx.Response(
+                200,
+                stream=httpx.ByteStream(compressed),
+                headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
+            )
+        if req.url.host == "172.25.100.105":
+            text = '<select name="drlouming"><option value="01">梧桐树</option></select>'
+        elif req.method == "GET":
+            text = '<form action="login.do"><select name="buildingId"><option value="54">官方楼栋</option></select></form>'
+        elif req.url.path.endswith("login.do"):
+            form = parse_qs(req.content.decode(), encoding="gb18030")
+            assert form["buildingId"] == ["54"]
+            text = (
+                '<form action="selectList.do"><input type="hidden" name="roomId" value="42"></form>'
+            )
+        else:
+            date = str(datetime.now(SHANGHAI).date())
+            text = f'<table id="oTable"><tr><td>1</td><td>{location.roomName}</td><td>4</td><td>12</td><td>50</td><td>{date}</td></tr></table>'
+        return httpx.Response(
+            200,
+            content=text.encode("gb18030"),
+            headers={"Content-Type": "text/html; charset=gb2312"},
+        )
+
+    def factory():
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(plugin_module, "OfficialProvider", lambda: OfficialProvider(factory))
+    monkeypatch.setattr(plugin_module, "IotunProvider", lambda: IotunProvider(factory))
+    monkeypatch.setattr(plugin_module, "get_astrbot_data_path", lambda: str(tmp_path))
+    config = AstrBotConfig(
+        str(tmp_path / "config.json"), schema=json.loads((root / "_conf_schema.json").read_text())
+    )
+    sent = []
+
+    async def send(origin, chain):
+        sent.append((origin, chain))
+        return True
+
+    context = SimpleNamespace(send_message=send)
+    plugin = plugin_module.SzuHelperPlugin(context, config)
+    await plugin.initialize()
+    try:
+        assert (await plugin.service.catalog()).areas[0].buildings[0].name == "官方楼栋"
+        requests.clear()
+        # Mutate the actual config without rebuilding the service or monitors.
+        config["data_source"] = "iotun"
+        event = Event("绑定宿舍")
+        task = await started(plugin, event)
+        assert "请选择校区" in event.output()
+        await reply(plugin, "取消")
+        await task
+        assert (await plugin.service.catalog()).areas[0].buildings[0].name == "山茶斋"
+        imported = Event("绑定宿舍 " + encode(location))
+        await plugin.bind_dorm(imported)
+        assert "已绑定" in imported.output()
+        count = len(requests)
+        await plugin.export_dorm(Event("导出宿舍"))
+        assert len(requests) == count  # share export is entirely local
+        for command in ["用电", "用电 详情"]:
+            event = Event(command)
+            await plugin.electricity(event)
+            assert "剩余电量" in event.output()
+            if "详情" in command:
+                assert "iotun.com" in event.output()
+        await plugin.monitor.run()
+        admin = Event("发送低电量预警")
+        admin.role = "admin"
+        await plugin.send_low_power_alert(admin)
+        assert len(sent) == 2
+        assert all(host == "www.iotun.com" for host, _, _ in requests)
+        assert [params["days"] for _, path, params in requests if path == "/api/status"] == [
+            "3",
+            "31",
+            "3",
+            "3",
+        ]
+        assert await plugin.store.catalog("official") is not None
+        assert await plugin.store.catalog("iotun") is not None
+        requests.clear()
+        config["data_source"] = "official"
+        assert (await plugin.service.catalog()).areas[0].buildings[0].name == "官方楼栋"
+        await plugin.electricity(Event("用电"))
+        assert requests and all(host == "192.168.84.3" for host, _, _ in requests)
+        requests.clear()
+        await plugin.unbind_dorm(Event("解绑宿舍"))
+        assert requests == []
+    finally:
+        await plugin.terminate()
+        await asyncio.sleep(0)

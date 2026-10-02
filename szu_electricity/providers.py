@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Callable
 from datetime import datetime
@@ -29,13 +30,19 @@ IOTUN_BASE = "https://www.iotun.com"
 MAX_BODY = 2 * 1024 * 1024
 
 
-def new_client() -> httpx.AsyncClient:
+def new_client(*, timeout: httpx.Timeout | None = None) -> httpx.AsyncClient:
     return httpx.AsyncClient(
         trust_env=False,
         follow_redirects=False,
-        timeout=httpx.Timeout(12, connect=3),
+        timeout=timeout or httpx.Timeout(12, connect=3),
         headers={"User-Agent": "astrbot-plugin-szu-helper/0.1.0"},
     )
+
+
+def new_iotun_client() -> httpx.AsyncClient:
+    # Public HTTPS includes DNS and TLS; the campus portal's 3 s connect budget
+    # was also being applied here and could abort otherwise healthy connections.
+    return new_client(timeout=httpx.Timeout(30, connect=10))
 
 
 def same_origin(base: str, action: str) -> str:
@@ -46,8 +53,16 @@ def same_origin(base: str, action: str) -> str:
     return url
 
 
-async def request(client: httpx.AsyncClient, method: str, url: str, **kwargs) -> httpx.Response:
+async def request(
+    client: httpx.AsyncClient, method: str, url: str, *, source: str = "official", **kwargs
+) -> httpx.Response:
     origin = url
+    endpoint = urlsplit(origin)
+    label = (
+        f"iotun 公网接口（{endpoint.hostname}{endpoint.path}）"
+        if source == "iotun"
+        else "学校官方电费接口"
+    )
     try:
         for _ in range(6):
             async with client.stream(method, url, **kwargs) as response:
@@ -69,21 +84,39 @@ async def request(client: httpx.AsyncClient, method: str, url: str, **kwargs) ->
                     content.extend(block)
                     if len(content) > MAX_BODY:
                         raise ElectricityError("电费接口响应过大。")
+                # aiter_bytes() has already decompressed gzip/deflate. Keeping
+                # the wire encoding header would make Response decode it again.
+                headers = httpx.Headers(response.headers)
+                for name in ("content-encoding", "content-length", "transfer-encoding"):
+                    headers.pop(name, None)
                 return httpx.Response(
                     response.status_code,
-                    headers=response.headers,
+                    headers=headers,
                     content=bytes(content),
                     request=response.request,
                 )
         raise ElectricityError("电费门户重定向次数过多。")
     except httpx.HTTPStatusError as exc:
         raise ElectricityError(
-            f"电费接口返回 HTTP {exc.response.status_code}，请稍后重试。"
+            f"{label}返回 HTTP {exc.response.status_code}，请稍后重试。"
         ) from exc
     except httpx.RequestError as exc:
-        raise ElectricityError(
-            "无法连接电费接口；官方数据源需要校园网可达，请检查部署网络或在后台切换数据源。"
-        ) from exc
+        if isinstance(exc, httpx.DecodingError):
+            reason = "响应解压失败"
+        elif isinstance(exc, httpx.ConnectTimeout):
+            reason = "建立连接超时"
+        elif isinstance(exc, httpx.ReadTimeout):
+            reason = "等待响应超时"
+        elif isinstance(exc, httpx.TimeoutException):
+            reason = "请求超时"
+        else:
+            reason = f"连接失败（{type(exc).__name__}）"
+        hint = (
+            "请检查 AstrBot 所在主机到 www.iotun.com 的公网连通性。"
+            if source == "iotun"
+            else "官方数据源需要校园网可达，请检查部署网络或在后台切换数据源。"
+        )
+        raise ElectricityError(f"{label}{reason}；{hint}") from exc
 
 
 def html(response: httpx.Response) -> BeautifulSoup:
@@ -363,12 +396,30 @@ class OfficialProvider:
 class IotunProvider:
     name = "iotun"
 
-    def __init__(self, client_factory: Callable = new_client):
+    def __init__(self, client_factory: Callable = new_iotun_client):
         self.client_factory = client_factory
 
     async def _get(self, path: str, params: dict | None = None):
-        async with self.client_factory() as client:
-            response = await request(client, "GET", IOTUN_BASE + path, params=params)
+        # Retry this same public endpoint once for transient network/gateway
+        # failures. No request falls back to a school endpoint or another source.
+        for attempt in range(2):
+            try:
+                async with self.client_factory() as client:
+                    response = await request(
+                        client, "GET", IOTUN_BASE + path, source=self.name, params=params
+                    )
+                break
+            except ElectricityError as exc:
+                cause = exc.__cause__
+                transient = isinstance(
+                    cause, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)
+                ) or (
+                    isinstance(cause, httpx.HTTPStatusError)
+                    and cause.response.status_code in (502, 503, 504)
+                )
+                if attempt or not transient:
+                    raise
+                await asyncio.sleep(0.5)
         try:
             value = response.json()
             if not isinstance(value, dict) or value.get("ok") is not True:

@@ -73,8 +73,12 @@ class SzuHelperPlugin(Star):
     async def initialize(self):
         settings = Settings.parse(self.config)
         await self.store.open()
-        provider = OfficialProvider() if settings.source == "official" else IotunProvider()
-        self.service = ElectricityService(provider, self.store)
+        providers = {"official": OfficialProvider(), "iotun": IotunProvider()}
+        self.service = ElectricityService(
+            providers[settings.source],
+            self.store,
+            provider_selector=lambda: providers[Settings.parse(self.config).source],
+        )
         self.monitor = Monitor(
             self.store, self.service, self._notify, logger, settings.low_power_threshold
         )

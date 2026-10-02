@@ -132,3 +132,84 @@ async def test_http_limits_redirects_and_bad_json():
         await IotunProvider(factory(lambda r: httpx.Response(200, text="not json"))).catalog()
     with pytest.raises(ElectricityError, match="HTTP 503"):
         await IotunProvider(factory(lambda r: httpx.Response(503))).catalog()
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "deflate"])
+async def test_compressed_response_is_decoded_exactly_once(encoding):
+    import gzip
+    import json
+    import zlib
+
+    payload = json.dumps(
+        {
+            "ok": True,
+            "data": [{"group": "yuehai_sftest", "buildings": [{"id": "03", "name": "山茶斋"}]}],
+        },
+        ensure_ascii=False,
+    ).encode()
+    compressed = gzip.compress(payload) if encoding == "gzip" else zlib.compress(payload)
+
+    def handler(req):
+        return httpx.Response(
+            200,
+            stream=httpx.ByteStream(compressed),
+            headers={
+                "Content-Encoding": encoding,
+                "Content-Length": str(len(compressed)),
+                "Content-Type": "application/json; charset=utf-8",
+            },
+        )
+
+    async with factory(handler)() as client:
+        result = await request(client, "GET", "https://www.iotun.com/api/buildings", source="iotun")
+        assert result.content == payload
+        assert result.json()["ok"] is True
+        assert "content-encoding" not in result.headers
+        assert int(result.headers["content-length"]) == len(payload)
+    catalog = await IotunProvider(factory(handler)).catalog()
+    assert catalog.areas[0].buildings[0].name == "山茶斋"
+
+
+async def test_iotun_retries_same_endpoint_and_reports_actual_source():
+    calls = []
+
+    def transient(req):
+        calls.append(str(req.url))
+        if len(calls) == 1:
+            raise httpx.ConnectTimeout("temporary TLS delay", request=req)
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "data": [{"group": "lihu", "buildings": [{"id": "01", "name": "梧桐树"}]}],
+            },
+        )
+
+    catalog = await IotunProvider(factory(transient)).catalog()
+    assert len(catalog.areas[4].buildings) == 1
+    assert calls == ["https://www.iotun.com/api/buildings"] * 2
+
+    calls.clear()
+
+    def unavailable(req):
+        calls.append(str(req.url))
+        raise httpx.ConnectTimeout("offline", request=req)
+
+    with pytest.raises(ElectricityError) as error:
+        await IotunProvider(factory(unavailable)).catalog()
+    assert len(calls) == 2
+    assert "iotun 公网接口（www.iotun.com/api/buildings）建立连接超时" in str(error.value)
+    assert "校园网" not in str(error.value)
+
+
+async def test_uncompressed_body_limit_applies_to_compressed_responses():
+    import gzip
+
+    compressed = gzip.compress(b"x" * (MAX_BODY + 1))
+    async with factory(
+        lambda r: httpx.Response(
+            200, stream=httpx.ByteStream(compressed), headers={"Content-Encoding": "gzip"}
+        )
+    )() as client:
+        with pytest.raises(ElectricityError, match="过大"):
+            await request(client, "GET", "https://www.iotun.com/api/buildings", source="iotun")
