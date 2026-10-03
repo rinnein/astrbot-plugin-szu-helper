@@ -5,11 +5,14 @@ import copy
 import secrets
 import time
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 
 from .conversation import Selection
 from .models import ElectricityError
 from .presentation import choice_card
+from .qq_messages import QQSendError, _error_code, correlation, field
 
 INTERACTION_INTENT = 1 << 26
 
@@ -21,6 +24,9 @@ class _Hook:
     wrapper: object
     ready: bool
     active: bool = True
+    status: str = ""
+    methods: dict = dataclass_field(default_factory=dict)
+    sessions: dict = dataclass_field(default_factory=dict)
 
 
 class KeyboardBridge:
@@ -44,15 +50,54 @@ class KeyboardBridge:
             if adapter.meta().name == "qq_official":
                 self.attach(adapter)
 
+    def _refresh(self, hook):
+        """Read negotiated session intents, never infer them from client.intents."""
+        client = hook.client
+        sockets = getattr(client, "_active_websockets", None)
+        if sockets is not None:
+            sessions = [
+                ws._session
+                for ws in sockets
+                if getattr(ws, "_session", None) is not None
+                and getattr(ws, "_conn", None) is not None
+                and not getattr(ws._conn, "closed", False)
+            ]
+        else:
+            # Older SDKs do not expose active sockets; our instance-scoped
+            # bot_connect hook keeps the actual sessions until disconnect.
+            sessions = list(hook.sessions.values())
+        ready = bool(sessions) and all(
+            s.get("session_id") and s.get("intent", 0) & INTERACTION_INTENT for s in sessions
+        )
+        status = "ready" if ready else "waiting_subscription"
+        if hook.status != status:
+            hook.status = status
+            if ready:
+                self.logger.info("QQ keyboard 已就绪：当前连接已订阅互动事件")
+            else:
+                self.logger.warning(
+                    "QQ keyboard 等待互动订阅；当前使用 Markdown 编号选项。"
+                    "若机器人已连接，请在机器人管理中重连；仅恢复旧连接不能增加订阅。"
+                )
+        hook.ready = ready
+
+    @staticmethod
+    def _install(hook, name, wrapper):
+        client = hook.client
+        hook.methods[name] = (name in vars(client), getattr(client, name, None), wrapper)
+        setattr(client, name, wrapper)
+
     def attach(self, adapter):
         if self.closed:
             return
         platform_id = adapter.meta().id
         client = getattr(adapter, "client", None)
         if client is None or not isinstance(getattr(client, "intents", None), int):
+            self.logger.debug("QQ keyboard 不支持当前客户端接口")
             return
         existing = self.hooks.get(platform_id)
         if existing and existing.client is client:
+            self._refresh(existing)
             return
         if existing:
             self._detach(existing)
@@ -60,14 +105,8 @@ class KeyboardBridge:
                 if dialog.platform_id == platform_id:
                     dialog.close()
         previous = getattr(client, "on_interaction_create", None)
-        subscribed = bool(client.intents & INTERACTION_INTENT)
-        connected = getattr(client, "_connection", None) is not None
-        needs_reconnect = getattr(client, "_szu_interaction_needs_reconnect", False) or (
-            connected and not subscribed
-        )
-        client._szu_interaction_needs_reconnect = needs_reconnect
         client.intents |= INTERACTION_INTENT
-        state = _Hook(client, previous, None, not needs_reconnect)
+        state = _Hook(client, previous, None, False)
 
         async def handle(interaction):
             data = self._button_data(interaction)
@@ -82,18 +121,55 @@ class KeyboardBridge:
                 await previous(interaction)
 
         state.wrapper = handle
-        client.on_interaction_create = handle
+        self._install(state, "on_interaction_create", handle)
+
+        def readiness_handler(previous_handler):
+            async def ready(*args, **kwargs):
+                if state.active and not self.closed:
+                    self._refresh(state)
+                if callable(previous_handler):
+                    await previous_handler(*args, **kwargs)
+
+            return ready
+
+        for name in ("on_ready", "on_resumed"):
+            self._install(state, name, readiness_handler(getattr(client, name, None)))
+
+        connect = getattr(client, "bot_connect", None)
+        if callable(connect):
+
+            async def bot_connect(session):
+                if state.active and not self.closed:
+                    # A new IDENTIFY can add intents. RESUME must keep the
+                    # original negotiated mask and may still require reconnect.
+                    if not session.get("session_id"):
+                        session["intent"] = session.get("intent", 0) | INTERACTION_INTENT
+                    shard = session.get("shards", {}).get("shard_id", 0)
+                    state.sessions[shard] = session
+                try:
+                    return await connect(session)
+                finally:
+                    if state.active and not self.closed:
+                        if state.sessions.get(shard) is session:
+                            state.sessions.pop(shard, None)
+                        self._refresh(state)
+
+            self._install(state, "bot_connect", bot_connect)
+            # botpy captures the bound connector when constructing ConnectionSession.
+            # Hot-loading must also wrap that instance's captured callback.
+            connection = getattr(client, "_connection", None)
+            if getattr(connection, "_connect", None) == connect:
+                connection._connect = bot_connect
         self.hooks[platform_id] = state
-        if needs_reconnect:
-            self.logger.warning("QQ keyboard 需要重连此机器人以订阅互动事件；当前使用编号选项")
-        else:
-            self.logger.info("QQ keyboard 互动事件已接入")
+        self._refresh(state)
 
     @staticmethod
-    def _button_data(interaction):
-        data = getattr(
-            getattr(getattr(interaction, "data", None), "resolved", None), "button_data", ""
-        )
+    def _payload(interaction):
+        return field(interaction, "d", interaction)
+
+    @classmethod
+    def _button_data(cls, interaction):
+        data = field(field(field(cls._payload(interaction), "data"), "resolved"), "button_data", "")
         return data if isinstance(data, str) else ""
 
     def available(self, event):
@@ -101,78 +177,110 @@ class KeyboardBridge:
             return False
         import botpy.message
 
+        # A platform can be replaced independently of plugin reload.
+        get_adapter = getattr(self.context, "get_platform_inst", None)
+        adapter = get_adapter(event.get_platform_id()) if callable(get_adapter) else None
+        if adapter is not None:
+            self.attach(adapter)
         source = getattr(event.message_obj, "raw_message", None)
         hook = self.hooks.get(event.get_platform_id())
-        return bool(
-            hook
-            and hook.ready
-            and hook.active
-            and isinstance(source, (botpy.message.GroupMessage, botpy.message.C2CMessage))
+        supported = isinstance(source, (botpy.message.GroupMessage, botpy.message.C2CMessage))
+        if hook:
+            self._refresh(hook)
+        ready = bool(hook and hook.ready and hook.active and supported)
+        self.logger.debug(
+            "QQ keyboard 可用性 status=%s",
+            "unsupported" if not supported or not hook else hook.status,
         )
+        return ready
 
     async def handle(self, platform_id, api, interaction):
         data = self._button_data(interaction)
         if not data.startswith("szuh:") or len(data) > 128:
             return
-        interaction_id = getattr(interaction, "id", None)
+        payload = self._payload(interaction)
+        # Only inline keyboard callbacks belong to this plugin, not shortcut menus.
+        if field(payload, "type") != 11:
+            return
+        interaction_id = field(payload, "id")
         if not isinstance(interaction_id, str) or not interaction_id:
             self.logger.warning("QQ keyboard 回调缺少 interaction id")
             return
+        trace = correlation(interaction_id)
         key = (platform_id, interaction_id)
         now = time.monotonic()
         while self.seen and (next(iter(self.seen.values())) < now - 300 or len(self.seen) >= 4096):
             self.seen.popitem(last=False)
         if key in self.seen:
+            self.logger.debug("QQ keyboard 重复回调 trace=%s", trace)
             return
+        # Reserve before any await. Even an ambiguous ACK timeout must not cause
+        # a second ACK for this ID; a fresh click can retry the unchanged step.
         self.seen[key] = now
         parts = data.split(":")
         dialog = self.dialogs.get(parts[1]) if len(parts) == 4 else None
-        code, action = 1, None
+        code, action, reason = 1, None, "expired_or_unknown_flow"
         if dialog and not dialog.expired():
-            scene = getattr(interaction, "scene", None)
-            peer = (
-                getattr(interaction, "group_openid", None)
-                if scene == "group"
-                else getattr(interaction, "user_openid", None)
+            scene = field(payload, "scene") or {0: "guild", 1: "group", 2: "c2c"}.get(
+                field(payload, "chat_type")
             )
-            sender = (
-                getattr(interaction, "group_member_openid", None)
-                if scene == "group"
-                else getattr(interaction, "user_openid", None)
-            )
+            peer = field(payload, "group_openid" if scene == "group" else "user_openid")
+            sender = field(payload, "group_member_openid" if scene == "group" else "user_openid")
             if (
                 platform_id != dialog.platform_id
                 or scene != dialog.scene
                 or peer != dialog.peer_id
                 or sender != dialog.owner
             ):
-                code = 4
-            elif getattr(interaction, "type", None) != 11:
-                code = 1
+                code, reason = 4, "wrong_owner_or_session"
             elif parts[2] != str(dialog.revision) or dialog.busy:
-                code = 3
+                code, reason = 3, "stale_or_busy"
             elif parts[3] in dialog.actions:
-                code, action = 0, dialog.actions[parts[3]]
+                code, action, reason = 0, dialog.actions[parts[3]], "accepted"
                 dialog.busy = True  # reserve before the ACK yields control
+            else:
+                reason = "unknown_action"
+        self.logger.debug("QQ keyboard 回调 trace=%s result=%s code=%s", trace, reason, code)
         try:
             async with asyncio.timeout(3):
                 await api.on_interaction_result(interaction_id, code)
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             if action is not None:
                 dialog.busy = False
-            self.logger.warning("QQ keyboard 回调确认失败：%s", type(exc).__name__)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            self.logger.warning(
+                "QQ keyboard 回调确认失败 trace=%s error=%s code=%s",
+                trace,
+                type(exc).__name__,
+                _error_code(exc),
+            )
             return
         if action is not None:
-            await dialog.process(action, dialog.event, interaction=interaction, claimed=True)
+            # Preserve the outer dispatch ID for the follow-up passive message.
+            from types import SimpleNamespace
+
+            trigger = SimpleNamespace(
+                event_id=field(interaction, "id")
+                if isinstance(interaction, Mapping) and "d" in interaction
+                else field(interaction, "event_id")
+            )
+            await dialog.process(action, dialog.event, interaction=trigger, claimed=True)
 
     @staticmethod
     def _detach(hook):
         hook.active = False
-        if getattr(hook.client, "on_interaction_create", None) is hook.wrapper:
-            if hook.previous is None:
-                delattr(hook.client, "on_interaction_create")
-            else:
-                hook.client.on_interaction_create = hook.previous
+        connection = getattr(hook.client, "_connection", None)
+        connector = hook.methods.get("bot_connect")
+        if connector and getattr(connection, "_connect", None) is connector[2]:
+            connection._connect = connector[1]
+        for name, (was_local, previous, wrapper) in hook.methods.items():
+            if getattr(hook.client, name, None) is wrapper:
+                if was_local:
+                    setattr(hook.client, name, previous)
+                else:
+                    delattr(hook.client, name)
+        hook.sessions.clear()
         # Do not remove a connection-wide Intent that another plugin may need.
 
     async def close(self):
@@ -233,6 +341,9 @@ class BindingDialog:
         self.keep()
         if keyboard and receipt is not None and not receipt.keyboard:
             self.keyboard_disabled = True
+            self.logger.warning(
+                "QQ keyboard 本次流程已降级 status=rejected；继续使用 Markdown 编号选项"
+            )
         self.actions = actions if keyboard and not self.keyboard_disabled else {}
         self.retirer.schedule(old)
 
@@ -256,9 +367,11 @@ class BindingDialog:
                 return
             if location is not None and location != "new":
                 confirmation = await self.persist(event, location)
-                await self.finish(event, confirmation, interaction=interaction)
+                await self.finish(event, confirmation, interaction=interaction, committed=True)
                 return
             await self.present(event, candidate, interaction=interaction)
+        except QQSendError as exc:
+            self.logger.warning("绑定消息发送失败 committed=%s reason=%s", self.closed, str(exc))
         except Exception as exc:
             self.logger.warning(
                 "绑定步骤未完成：%s",
@@ -281,16 +394,23 @@ class BindingDialog:
         finally:
             self.busy = False
 
-    async def finish(self, event, text, *, interaction=None):
+    async def finish(self, event, text, *, interaction=None, committed=False):
         # Persisting a binding has already succeeded; a failed confirmation must
         # not allow an old button to repeat or replace that committed operation.
-        self.closed = True
         try:
             await self.send(event, text, interaction=interaction)
-        finally:
-            self.controller.stop()
-            self.retirer.schedule(self.receipt)
-            self.receipt = None
+        except QQSendError:
+            if committed:
+                self.closed = True
+                self.controller.stop()
+                # Leave the prior card visible but inert if the confirmation
+                # failed. The committed binding must not be applied a second time.
+                self.receipt = None
+            raise
+        self.closed = True
+        self.controller.stop()
+        self.retirer.schedule(self.receipt)
+        self.receipt = None
 
     def close(self):
         self.closed = True

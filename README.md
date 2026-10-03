@@ -52,9 +52,9 @@ QQ 官方群聊、私聊的选择步骤使用 Markdown 卡片与 keyboard，**�
 
 ### QQ 按钮首次启用
 
-插件在启动和平台加载时订阅 `INTERACTION_CREATE`，并接入当前 QQ WebSocket 客户端的回调。若首次安装时 QQ 机器人已连接且尚未订阅互动事件，请在 AstrBot 机器人管理中重连该机器人一次（仅重载插件不能改变已经建立的 WebSocket 订阅）。插件不会强制断开机器人；日志会提示需重连，期间继续提供编号菜单。
+插件在启动和平台加载时接入当前 QQ WebSocket 客户端的 `INTERACTION_CREATE` 回调，并为新连接订阅互动事件。按钮是否可用以实际连接的订阅为准，在连接就绪及重连后重新检查，不会永久停留在“需要重连”。若首次安装时 QQ 机器人已连接且尚未订阅互动事件，请在 AstrBot 机器人管理中重连该机器人一次；仅重载插件或恢复旧 WebSocket 会话不能增加订阅。插件不会强制断开机器人；等待订阅期间提供 Markdown 编号菜单，订阅成功后的下一步自动恢复按钮。
 
-若 QQ 账号无自定义 keyboard 权限或接口明确拒绝按钮，会自动降级为 Markdown 编号菜单。Markdown 不可用时继续降级为文字，不会丢失绑定流程。详情默认使用“指标 / 数值”表格，极简查询仍为短文本；QQ 客户端的视觉渲染无法通过 HTTP 响应检测，表格显示异常时请将 `detail_layout` 改为 `list`。
+若 QQ 账号无自定义 keyboard 权限或接口明确拒绝按钮，本次绑定流程会降级为 Markdown 编号菜单。Markdown 排版被明确拒绝时尝试简化 Markdown；仍被拒绝则记录发送失败，**不降级为纯文本，不把无效 @ 当作通知成功**。下一步发送失败时保留原菜单，可再次点击或输入编号。详情默认使用“指标 / 数值”表格，极简查询仍保持简短内容；QQ 客户端的视觉渲染无法通过 HTTP 响应检测，表格显示异常时请将 `detail_layout` 改为 `list`。
 
 目录沿用 Your SZU Life 的“校区 → 宿舍区域 → 楼栋 → 宿舍号”：北校区（粤海）、南校区（沧海）、西丽校区（丽湖），包含粤海宿舍、新斋区、沧海宿舍、丽湖宿舍、丽湖二期五个区域。iotun 的“粤海新宿舍”九栋会映射回原有 SIMS 楼栋，不新增分类。
 
@@ -84,19 +84,19 @@ QQ 官方群聊、私聊的选择步骤使用 Markdown 卡片与 keyboard，**�
 
 手动检查不读取或修改自动预警的低电量状态及发送记录，不调整定时任务或下一次执行时间。关闭定时任务时仍可使用；手动发送也不会消耗下一次自动提醒。发送前仍检查当前绑定，已解绑或换宿舍的旧绑定不会被通知。
 
-命令回复提及发起人，批量预警提及宿舍绑定者。QQ 官方群聊及频道使用官方最新文本交互协议 **`<qqbot-at-user id="member_openid" />`**，文本和 Markdown 均适用；其他平台使用 AstrBot `At` 组件。旧 `<@userid>` 格式已移除，不以用户名文本冒充提及。私聊不添加群聊提及，分享码仍为原编码正文。
+命令回复提及发起人，批量预警提及宿舍绑定者。QQ 官方群聊及频道使用官方最新文本交互协议 **`<qqbot-at-user id="member_openid" />`**，**所有包含该提及标签的消息都使用 Markdown 模式**，包括普通查询、绑定结果、错误提示及手动/定时预警。群聊使用 `msg_type=2`，提及放在 `markdown.content` 中，不发送非空 `content`；其他平台使用 AstrBot `At` 组件。旧 `<@userid>` 格式已移除，不以用户名文本冒充提及。私聊不添加群聊提及，分享码仍为原编码正文。
 
 命令回复优先引用触发它的用户消息。其他平台使用 `Reply` 组件；QQ 官方群聊/私聊从原消息 `message_scene.ext` 的 `msg_idx` 读取引用索引，写入 `message_reference.message_id`。这与被动回复参数 `msg_id`、撤回使用的发送回执 `id` 均不同，也不会使用指向更早消息的 `ref_msg_idx`。QQ 没有下发引用索引时保留正文和提及，日志会说明缺少引用索引。
 
-按钮回调仅处理本插件自己的流程标识，保留其他处理器；卸载时解除回调接入。流程及消息回执只存于内存，重载后旧按钮失效，不修改已有宿舍、缓存及预警记录。引用数据中的 `auth_token` 不会被复制、记录或用于按钮数据。
+按钮回调仅处理本插件自己的流程标识，保留其他处理器；卸载时解除互动、连接及就绪回调接入。回调在 3 秒内使用事件内层 `d.id` 确认，同一事件只确认一次；点击后的下一步消息使用外层事件 `id` 作为 `event_id`，两者不能互换。确认失败不推进流程，释放操作锁后允许重新点击。流程及消息回执只存于内存，重载后旧按钮失效，不修改已有宿舍、缓存及预警记录。引用数据中的 `auth_token` 不会被复制、记录或用于按钮数据。
 
-相关协议说明：[QQ 群消息及 keyboard](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html)、[文本交互与新版 @](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/trans/text-chain.html)、[撤回群聊消息](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages_message_id.delete.html)。主动消息是否可用仍由当前平台适配器的能力声明决定。
+相关协议说明：[QQ 群消息及 keyboard](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html)、[文本交互与新版 @](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/trans/text-chain.html)、[撤回群聊消息](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages_message_id.delete.html)。另见 [互动事件](https://bot.q.qq.com/wiki/develop/api-v2/autogen/event/interaction_create.html) 与 [互动确认](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/interactions_interaction_id.put.html)。主动消息是否可用仍由当前平台适配器的能力声明决定。
 
 QQ 官方 WebSocket 机器人支持主动预警（已对照 AstrBot 4.28.2 适配器验证）。按 [QQ 官方 WebSocket 文档](https://docs.astrbot.app/platform/qqofficial/websockets.html) 在 QQ 群的机器人设置中开启“机器人主动在群聊内发言”。旧版适配器若不支持主动消息，会给出明确提示。若重启后 QQ 群/频道发送上下文丢失，请先在目标会话给机器人发一条消息后再试；插件不会将适配器跳过发送误记为成功。
 
 手动预警的汇总会列出未发出原因，例如平台实例不可用、适配器不支持主动消息、QQ 会话上下文缺失或发送超时。
 
-发送记录在平台调用无异常并返回成功后保存。平台无法提供端到端幂等确认时，进程恰好在发送成功与记录落库之间崩溃，可能导致下次重复提醒；正常重启有持久化去重。
+QQ 命令回复和预警共用插件的 SDK 发送层，避免 AstrBot 适配器自动降级为纯文本。QQ 发送必须返回实际消息 `id` 才记为成功，Markdown 被拒绝、网络异常或缺少回执均不记录为已提醒。其他平台的发送记录在平台调用无异常并返回成功后保存。平台无法提供端到端幂等确认时，进程恰好在发送成功与记录落库之间崩溃，可能导致下次重复提醒；正常重启有持久化去重。
 
 ## 数据存储
 
@@ -109,12 +109,14 @@ QQ 官方 WebSocket 机器人支持主动预警（已对照 AstrBot 4.28.2 适�
 使用 AstrBot 提供的插件专属 `self.logger`，日志统一进入 AstrBot 日志面板和现有日志文件，并遵循本插件的日志等级设置；旧版 AstrBot 自动兼容全局 logger。不单独创建日志文件或配置日志处理器。
 
 - `INFO`：初始化配置摘要、目录/查询结果、批量检查汇总和发送成功。
-- `DEBUG`：缓存命中及年龄、请求合并、数据源请求、余额时间与历史用电时间的区别。
+- `DEBUG`：缓存命中及年龄、请求合并、数据源请求、余额时间与历史用电时间的区别；keyboard 可用状态、回调校验结果及脱敏 `trace`。
 - `WARNING/ERROR`：接口重试、查询失败、余额不可用原因及主动消息发送失败。
 
 排查时可把本插件日志等级设为 `DEBUG`，按插件标记 `astrbot_plugin_szu_helper` 查看。`observed_at` 是余额读数时间；`reason=stale` 表示实际超过 48 小时，`missing_balance` 表示接口没返回余额，`missing_timestamp` 表示缺少可信的余额时间，`future_timestamp` 表示读数时间异常地晚于当前时间。
 
-日志不记录分享码、用户/群标识、宿舍标识、凭证或完整接口响应，只记录数据来源、日期、数量和错误类别。
+按钮没有显示时，查看 `status=waiting_subscription`（等待订阅，需要新连接）、`status=rejected`（本次流程的 keyboard 被接口拒绝）或 `status=unsupported`（不支持的消息场景或客户端）。`QQ keyboard 已就绪` 表示已检查当前连接的互动订阅。发送失败日志记录错误类别与 QQ 错误码，回调日志通过哈希后的 `trace` 关联，不输出原始事件标识。
+
+日志不记录分享码、完整用户/群标识、宿舍标识、凭证或完整接口响应。
 
 ## 开发验证
 

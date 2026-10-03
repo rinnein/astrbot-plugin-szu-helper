@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import html
 from collections import defaultdict
 from pathlib import Path
 
@@ -12,7 +11,6 @@ from astrbot.api import logger as astrbot_logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import At, Plain, Reply
 from astrbot.api.star import Context, Star
-from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from astrbot.core.utils.session_waiter import (
     FILTERS,
@@ -30,8 +28,9 @@ from .szu_electricity.monitor import Monitor
 from .szu_electricity.presentation import detail_view
 from .szu_electricity.providers import IotunProvider, OfficialProvider
 from .szu_electricity.qq_interactions import BindingDialog, KeyboardBridge
-from .szu_electricity.qq_messages import MessageRetirer, MessageView
+from .szu_electricity.qq_messages import MessageRetirer, MessageView, QQSendError
 from .szu_electricity.qq_messages import mention as qq_mention
+from .szu_electricity.qq_messages import notify as qq_notify
 from .szu_electricity.qq_messages import reply as qq_reply
 from .szu_electricity.service import ElectricityService
 from .szu_electricity.sharing import decode, encode
@@ -202,6 +201,8 @@ class SzuHelperPlugin(Star):
         self.logger.debug("处理指令 command=%s platform=%s", command, event.get_platform_name())
         try:
             await work()
+        except QQSendError as exc:
+            self.logger.warning("QQ 指令回复发送失败 command=%s reason=%s", command, str(exc))
         except ElectricityError as exc:
             self.logger.warning("指令未完成 command=%s reason=%s", command, str(exc))
             await self._reply(event, str(exc))
@@ -395,47 +396,32 @@ class SzuHelperPlugin(Star):
             raise ElectricityError("绑定的平台实例已不可用，请在目标会话重新绑定宿舍。")
         metadata = adapter.meta()
         platform = metadata.name
-        qq_scene = None
         if not getattr(metadata, "support_proactive_message", True):
             raise ElectricityError(
                 f"当前 {platform} 适配器声明不支持主动消息，请检查 AstrBot 版本及平台配置。"
             )
-        if platform == "qq_official" and bindings[0].is_group:
-            # AstrBot 4.28 can silently skip a group/channel whose in-memory
-            # delivery context was lost. Do not record that skip as success.
-            scenes = getattr(adapter, "_session_scene", None)
-            messages = getattr(adapter, "_session_last_message_id", None)
-            if isinstance(scenes, dict) and isinstance(messages, dict):
-                session_id = MessageSession.from_str(bindings[0].origin).session_id.rsplit("_", 1)[
-                    -1
-                ]
-                qq_scene = scenes.get(session_id)
-                proactive_group = qq_scene == "group" and getattr(
-                    adapter, "_allow_group_proactive_send", False
-                )
-                if not messages.get(session_id) and not proactive_group:
-                    raise ElectricityError(
-                        "QQ 官方机器人的目标会话上下文缺失，请先在该群或频道给机器人发送一条消息后重试。"
-                    )
-        chain = []
-        for binding in bindings:
-            chain.extend(
-                self._mention(
-                    platform,
-                    binding.is_group,
-                    binding.sender_id,
-                    binding.sender_name,
-                    qq_scene=qq_scene,
-                )
-            )
         text = f"宿舍 {report.location.buildingName} {report.location.roomName} 剩余电量 {fmt(report.remaining)} 度，低于 {self.monitor.threshold:g} 度，请及时充值。"
-        chain.append(Plain(html.escape(text, quote=False) if platform == "qq_official" else text))
-        message = MessageChain(chain)
         if platform == "qq_official":
-            message.use_markdown_ = False
-        sent = await self.context.send_message(bindings[0].origin, message)
-        if not sent:
-            raise ElectricityError("主动发送时未找到目标平台实例，请检查机器人连接状态。")
+            await qq_notify(
+                adapter, bindings[0], [b.sender_id for b in bindings], text, self.logger
+            )
+            sent = True
+        else:
+            chain = []
+            for binding in bindings:
+                chain.extend(
+                    self._mention(
+                        platform,
+                        binding.is_group,
+                        binding.sender_id,
+                        binding.sender_name,
+                    )
+                )
+            sent = await self.context.send_message(
+                bindings[0].origin, MessageChain([*chain, Plain(text)])
+            )
+            if not sent:
+                raise ElectricityError("主动发送时未找到目标平台实例，请检查机器人连接状态。")
         self.logger.info(
             "低电量预警已发送 platform=%s group=%s recipients=%s",
             platform,

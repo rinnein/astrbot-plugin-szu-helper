@@ -85,7 +85,17 @@ async def setup_dialog(plugin, monkeypatch, *, private=False, reject_keyboard=Fa
     api.reject_keyboard = reject_keyboard
     event = await make_qq_incoming(api, "private" if private else "group")
     event.message_str = "绑定宿舍"
-    client = SimpleNamespace(api=api, intents=0, _connection=None)
+    client = SimpleNamespace(
+        api=api,
+        intents=INTERACTION_INTENT,
+        _connection=object(),
+        _active_websockets=[
+            SimpleNamespace(
+                _session={"session_id": "negotiated", "intent": INTERACTION_INTENT},
+                _conn=SimpleNamespace(closed=False),
+            )
+        ],
+    )
     adapter = SimpleNamespace(client=client, meta=lambda: event.platform_meta)
     plugin.context.get_platform_inst = lambda _: adapter
     plugin.keyboard.attach(adapter)
@@ -182,7 +192,7 @@ async def test_failed_next_card_keeps_old_state_and_never_reuses_revision(plugin
     assert not any(e[0] == "delete" for e in api.events)
     api.fail_send = False
     await client.on_interaction_create(interaction(data, id="retry"))
-    assert dialog.selection.step == 1 and dialog.revision >= 4
+    assert dialog.selection.step == 1 and dialog.revision >= 3
     assert dialog.receipt.message_id != old.message_id
     await click(client, api, "取消", 3)
     await task
@@ -232,7 +242,7 @@ async def test_bridge_preserves_handlers_and_requests_reconnect_only_when_needed
     adapter.client = new_client
     ready = KeyboardBridge(SimpleNamespace(), logging.getLogger())
     ready.attach(adapter)
-    assert ready.hooks["qq-main"].ready
+    assert not ready.hooks["qq-main"].ready  # wait for actual IDENTIFY/READY
     await ready.close()
     assert not hasattr(new_client, "on_interaction_create")
 
@@ -313,7 +323,7 @@ async def test_markdown_table_fallback_and_transport_errors(plugin, monkeypatch,
         raise OSError("connection reset")
 
     api.post_group_message = unavailable
-    with pytest.raises(OSError):
+    with pytest.raises(plugin_module.QQSendError):
         await plugin._reply(event, view)
     assert len(calls) == 1
 
@@ -328,12 +338,19 @@ async def test_real_sdk_dispatches_keyboard_callback(plugin, monkeypatch):
     client.loop = asyncio.get_running_loop()
     client.intents = INTERACTION_INTENT
     client._connection = None
+    client._active_websockets = [
+        SimpleNamespace(
+            _session={"session_id": "sdk-session", "intent": INTERACTION_INTENT},
+            _conn=SimpleNamespace(closed=False),
+        )
+    ]
     client.api = api
     adapter = SimpleNamespace(client=client, meta=lambda: event.platform_meta)
     # Keep this live dialog for testing dispatch rather than platform-reload cancellation.
     hook = plugin.keyboard.hooks.pop("qq-main")
     plugin.keyboard._detach(hook)
     plugin.keyboard.attach(adapter)
+    plugin.context.get_platform_inst = lambda _: adapter
     data = api.posts[-1]["keyboard"]["content"]["rows"][0]["buttons"][0]["action"]["data"]
     api.posted.clear()
     state = ConnectionState(client.ws_dispatch, api)
@@ -439,7 +456,7 @@ async def test_recall_failure_does_not_break_flow_and_rate_limit_is_per_platform
     await retirer.close()
 
 
-async def test_markdown_can_fall_back_to_plain_and_receipt_requires_message_id(plugin, monkeypatch):
+async def test_markdown_stays_markdown_and_receipt_requires_message_id(plugin, monkeypatch):
     import botpy.errors
 
     monkeypatch.setenv("ASTRBOT_DISABLE_METRICS", "1")
@@ -455,10 +472,11 @@ async def test_markdown_can_fall_back_to_plain_and_receipt_requires_message_id(p
     api.post_group_message = rejected
     event = await make_qq_incoming(api)
     view = plugin_module.MessageView("完整正文", "## 标题", fallback_markdown="- 简单列表")
-    receipt = await plugin._reply(event, view)
-    assert len(calls) == 3 and receipt.message_id == "plain-result"
-    assert calls[-1]["msg_type"] == 0 and "markdown" not in calls[-1]
-    assert calls[-1]["content"].startswith('<qqbot-at-user id="member-openid" />')
+    with pytest.raises(plugin_module.QQSendError, match="Markdown"):
+        await plugin._reply(event, view)
+    assert len(calls) == 3
+    assert all(p["msg_type"] == 2 and "content" not in p for p in calls)
+    assert calls[-1]["markdown"]["content"].startswith('<qqbot-at-user id="member-openid" />')
     assert "message_reference" in calls[-1]
 
     async def no_id(**payload):
@@ -500,7 +518,7 @@ async def test_detail_command_uses_configured_markdown_layout(plugin, monkeypatc
     assert "| 指标 |" not in api.posts[-1]["markdown"]["content"]
     event.message_str = "用电"
     await plugin.electricity(event)
-    assert api.posts[-1]["msg_type"] == 0 and "markdown" not in api.posts[-1]
+    assert api.posts[-1]["msg_type"] == 2 and "content" not in api.posts[-1]
 
 
 async def test_unload_restores_callback_and_invalidates_pending_buttons(plugin, monkeypatch):
@@ -511,3 +529,429 @@ async def test_unload_restores_callback_and_invalidates_pending_buttons(plugin, 
     assert not plugin.keyboard.dialogs
     assert not hasattr(client, "on_interaction_create")
     assert not plugin.retirer._tasks
+
+
+class LifecycleClient:
+    """Keep botpy's captured connector and actual session mask semantics."""
+
+    def __init__(self):
+        self.intents = 0
+        self.api = API()
+        self._active_websockets = []
+        self._connection = SimpleNamespace(_connect=self.bot_connect)
+        self.connected = asyncio.Event()
+        self.disconnect = asyncio.Event()
+        self.events = []
+
+    async def on_ready(self):
+        self.events.append("ready")
+
+    async def on_resumed(self):
+        self.events.append("resumed")
+
+    async def on_interaction_create(self, event):
+        self.events.append("foreign")
+
+    async def bot_connect(self, session):
+        socket = SimpleNamespace(_session=session, _conn=SimpleNamespace(closed=False))
+        self._active_websockets.append(socket)
+        if session.get("session_id"):
+            await self.on_resumed()
+        else:
+            session["session_id"] = "server-session"
+            await self.on_ready()
+        self.connected.set()
+        try:
+            await self.disconnect.wait()
+        finally:
+            socket._conn.closed = True
+            self._active_websockets.remove(socket)
+
+
+def lifecycle_adapter(client):
+    return SimpleNamespace(
+        client=client, meta=lambda: SimpleNamespace(id="qq-main", name="qq_official")
+    )
+
+
+async def test_negotiated_intents_recover_on_same_client_and_survive_reload():
+    client = LifecycleClient()
+    adapter = lifecycle_adapter(client)
+    bridge = KeyboardBridge(SimpleNamespace(), logging.getLogger())
+    bridge.attach(adapter)
+    assert client.intents & INTERACTION_INTENT
+    assert not bridge.hooks["qq-main"].ready
+    old = {"session_id": "old-server-session", "intent": 0}
+    resumed = asyncio.create_task(client._connection._connect(old))
+    await client.connected.wait()
+    assert old["intent"] == 0 and client.events == ["resumed"]
+    assert not bridge.hooks["qq-main"].ready
+    client.disconnect.set()
+    await resumed
+    client.disconnect.clear()
+    client.connected.clear()
+    fresh = {"session_id": "", "intent": 0}
+    connection = asyncio.create_task(client._connection._connect(fresh))
+    await client.connected.wait()
+    assert fresh["intent"] & INTERACTION_INTENT
+    assert bridge.hooks["qq-main"].ready
+    assert client.events == ["resumed", "ready"]
+    await bridge.close()
+    assert client._connection._connect == client.bot_connect
+    assert all(
+        n not in vars(client)
+        for n in ("bot_connect", "on_ready", "on_resumed", "on_interaction_create")
+    )
+    reloaded = KeyboardBridge(SimpleNamespace(), logging.getLogger())
+    reloaded.attach(adapter)
+    assert reloaded.hooks["qq-main"].ready
+    await client.on_interaction_create(interaction("foreign:data"))
+    assert client.events[-1] == "foreign"
+    await reloaded.close()
+    client.disconnect.set()
+    await connection
+
+
+async def test_connect_captured_after_plugin_load_and_new_adapter_cleanup():
+    client = LifecycleClient()
+    client._connection = None
+    bridge = KeyboardBridge(SimpleNamespace(), logging.getLogger())
+    adapter = lifecycle_adapter(client)
+    bridge.attach(adapter)
+    client._connection = SimpleNamespace(_connect=client.bot_connect)
+    task = asyncio.create_task(client._connection._connect({"session_id": "", "intent": 0}))
+    await client.connected.wait()
+    assert bridge.hooks["qq-main"].ready
+    old_hook = bridge.hooks["qq-main"]
+    other = LifecycleClient()
+    adapter.client = other
+    bridge.attach(adapter)
+    assert not old_hook.active and not bridge.hooks["qq-main"].ready
+    assert client._connection._connect == client.bot_connect
+    await bridge.close()
+    client.disconnect.set()
+    await task
+
+
+async def test_numbered_menu_becomes_keyboard_after_real_subscription(plugin, monkeypatch):
+    api = API()
+    event = await make_qq_incoming(api)
+    event.message_str = "绑定宿舍"
+    session = {"session_id": "old-session", "intent": 0}
+    client = SimpleNamespace(
+        api=api,
+        intents=0,
+        _connection=object(),
+        _active_websockets=[SimpleNamespace(_session=session, _conn=SimpleNamespace(closed=False))],
+    )
+    adapter = lifecycle_adapter(client)
+    plugin.context.get_platform_inst = lambda _: adapter
+    plugin.keyboard.attach(adapter)
+    task = asyncio.create_task(plugin.bind_dorm(event))
+    await api.posted.wait()
+    assert "keyboard" not in api.posts[-1] and api.posts[-1]["msg_type"] == 2
+    # A new server session, not merely changing the desired client.intents.
+    session.update(session_id="new-session", intent=INTERACTION_INTENT)
+    await client.on_ready()
+    typed = await make_qq_incoming(api)
+    typed.message_str = "1"
+    await SessionAgent(plugin.context).handle_session_control_agent(typed)
+    assert "keyboard" in api.posts[-1]
+    await click(client, api, "取消", 1)
+    await task
+
+
+@pytest.mark.parametrize("private", [False, True])
+async def test_official_envelope_through_real_sdk_http_ack_and_followup(
+    plugin, monkeypatch, private
+):
+    import botpy
+    from botpy.api import BotAPI
+    from botpy.connection import ConnectionState
+
+    monkeypatch.setenv("ASTRBOT_DISABLE_METRICS", "1")
+
+    class HTTP:
+        def __init__(self):
+            self.calls, self.posts = [], []
+            self.posted = asyncio.Event()
+
+        async def request(self, route, **kwargs):
+            payload = copy.deepcopy(kwargs.get("json"))
+            self.calls.append((route.method, route.url, payload))
+            if route.method == "POST":
+                self.posts.append(payload)
+                self.posted.set()
+                return {"id": f"wire-message-{len(self.posts)}"}
+            return None  # PUT/DELETE succeed without a response body
+
+    http = HTTP()
+    api = BotAPI(http)
+    event = await make_qq_incoming(api, "private" if private else "group")
+    event.message_str = "绑定宿舍"
+    client = object.__new__(botpy.Client)
+    client.loop, client.api, client.intents = asyncio.get_running_loop(), api, INTERACTION_INTENT
+    client._connection = None
+    client._active_websockets = [
+        SimpleNamespace(
+            _session={"session_id": "session", "intent": INTERACTION_INTENT},
+            _conn=SimpleNamespace(closed=False),
+        )
+    ]
+    adapter = lifecycle_adapter(client)
+    plugin.context.get_platform_inst = lambda _: adapter
+    plugin.keyboard.attach(adapter)
+    task = asyncio.create_task(plugin.bind_dorm(event))
+    await http.posted.wait()
+    state = ConnectionState(client.ws_dispatch, api)
+
+    async def dispatch(label, inner):
+        data = button(http.posts[-1], label)["action"]["data"]
+        raw = {
+            "op": 0,
+            "t": "INTERACTION_CREATE",
+            "id": "INTERACTION_CREATE:" + inner,
+            "d": {
+                "id": inner,
+                "type": 11,
+                "chat_type": 2 if private else 1,
+                "user_openid": "user-openid",
+                "group_openid": "group-openid",
+                "group_member_openid": "member-openid",
+                "data": {"resolved": {"button_data": data}},
+            },
+        }
+        http.posted.clear()
+        state.parse_interaction_create(raw)
+        async with asyncio.timeout(2):
+            await http.posted.wait()
+        assert any(
+            method == "PUT" and url.endswith("/interactions/" + inner) and body == {"code": 0}
+            for method, url, body in http.calls
+        )
+        assert http.posts[-1]["event_id"] == "INTERACTION_CREATE:" + inner
+        assert not http.posts[-1].get("msg_id")
+        return raw
+
+    raw = await dispatch("北校区（粤海校区）", "first-click")
+    snapshot = len(http.calls)
+    # Raw envelopes are accepted too; SDK dispatch and raw delivery deduplicate together.
+    await plugin.keyboard.handle("qq-main", api, raw)
+    assert len(http.calls) == snapshot
+    await dispatch("取消", "second-click")
+    await task
+    await plugin.retirer.drain()
+    for payload in http.posts:
+        # The SDK includes null defaults; non-empty content with Markdown is forbidden.
+        if payload.get("markdown"):
+            assert not payload.get("content") and payload["msg_type"] == 2
+        else:
+            assert private and "qqbot-at-user" not in payload["content"]
+    first = http.posts[0]
+    assert first["message_reference"]["message_id"] == "REFIDX_this-message=="
+    rows = first["keyboard"]["content"]["rows"]
+    assert rows[0]["buttons"][0]["action"]["type"] == 1
+    assert rows[0]["buttons"][0]["action"]["permission"] == {
+        "type": 0,
+        "specify_user_ids": ["user-openid" if private else "member-openid"],
+    }
+    deletes = [url for method, url, _ in http.calls if method == "DELETE"]
+    assert len(deletes) == 2 and all("wire-message-" in url for url in deletes)
+
+
+async def test_raw_callback_ack_failure_keeps_step_and_allows_fresh_click(
+    plugin, monkeypatch, caplog
+):
+    api, event, client, task = await setup_dialog(plugin, monkeypatch)
+    dialog = next(iter(plugin.keyboard.dialogs.values()))
+    data = button(api.posts[-1], "取消")["action"]["data"]
+    raw = {
+        "id": "OUTER-secret-event",
+        "d": {
+            "id": "INNER-secret-event",
+            "type": 11,
+            "chat_type": 1,
+            "group_openid": "group-openid",
+            "group_member_openid": "member-openid",
+            "data": {"resolved": {"button_data": data}},
+        },
+    }
+    count = 0
+
+    async def timeout_ack(id, code):
+        nonlocal count
+        count += 1
+        raise TimeoutError("must-not-log-this-credential")
+
+    original = api.on_interaction_result
+    api.on_interaction_result = timeout_ack
+    with caplog.at_level(logging.DEBUG):
+        await client.on_interaction_create(raw)
+        await client.on_interaction_create(raw)
+    assert count == 1 and not dialog.busy and not task.done()
+    assert len(api.posts) == 1
+    assert "回调确认失败" in caplog.text
+    assert "secret-event" not in caplog.text and "must-not-log" not in caplog.text
+    api.on_interaction_result = original
+    raw["d"]["id"] = "fresh-click"
+    await client.on_interaction_create(raw)
+    await task
+    assert len(api.posts) == 2
+
+
+async def test_cancel_send_failure_preserves_menu_and_no_implicit_resend(plugin, monkeypatch):
+    api, event, client, task = await setup_dialog(plugin, monkeypatch)
+    dialog = next(iter(plugin.keyboard.dialogs.values()))
+    old = dialog.receipt
+    data = button(api.posts[-1], "取消")["action"]["data"]
+    api.fail_send = True
+    await client.on_interaction_create(interaction(data))
+    assert not task.done() and not dialog.closed and dialog.receipt is old
+    assert not any(e[0] == "delete" for e in api.events)
+    api.fail_send = False
+    await client.on_interaction_create(interaction(data, id="retry-cancel"))
+    await task
+
+
+async def test_all_qq_command_outputs_keep_mentions_in_markdown(plugin, monkeypatch, location):
+    from datetime import datetime
+
+    from szu_electricity.analytics import summarize
+    from szu_electricity.models import SHANGHAI, ProviderResult, Window
+    from szu_electricity.sharing import encode
+
+    monkeypatch.setenv("ASTRBOT_DISABLE_METRICS", "1")
+    api = API()
+    event = await make_qq_incoming(api)
+    event.message_str = "绑定宿舍 " + encode(location)
+    await plugin.bind_dorm(event)
+    event.message_str = "导出宿舍"
+    await plugin.export_dorm(event)
+    # Only the mention prefix is separate; the share code remains byte-for-byte identical.
+    assert api.posts[-1]["markdown"]["content"].partition("\n")[2] == encode(location)
+
+    async def query(location, detail=False):
+        return summarize(
+            location, "iotun", Window.for_days(3), ProviderResult([], 88, datetime.now(SHANGHAI))
+        )
+
+    plugin.service.query = query
+    event.message_str = "用电"
+    await plugin.electricity(event)
+    event.message_str = "用电 详情"
+    await plugin.electricity(event)
+    event.message_str = "发送低电量预警"
+    await plugin.send_low_power_alert(event)  # permission rejection
+    event.role = "admin"
+    await plugin.send_low_power_alert(event)  # start and summary messages
+    event.message_str = "解绑宿舍"
+    await plugin.unbind_dorm(event)
+    event.message_str = "用电"
+    await plugin.electricity(event)  # missing binding error
+    event.message_str = "绑定宿舍 bad-code"
+    await plugin.bind_dorm(event)  # malformed import error
+    assert len(api.posts) >= 10
+    for p in api.posts:
+        assert p["msg_type"] == 2 and "content" not in p
+        assert p["markdown"]["content"].startswith('<qqbot-at-user id="member-openid" />\n')
+
+
+async def test_qq_markdown_refusal_never_calls_adapter_fallback_or_marks_delivered(
+    plugin, location
+):
+    from datetime import datetime
+
+    import botpy.errors
+    from botpy.api import BotAPI
+
+    from szu_electricity.analytics import summarize
+    from szu_electricity.models import SHANGHAI, ProviderResult, Window
+
+    requests = []
+
+    class HTTP:
+        async def request(self, route, **kwargs):
+            requests.append(copy.deepcopy(kwargs["json"]))
+            raise botpy.errors.ForbiddenError("markdown permission denied")
+
+    adapter = SimpleNamespace(
+        meta=lambda: SimpleNamespace(name="qq_official", support_proactive_message=True),
+        client=SimpleNamespace(api=BotAPI(HTTP())),
+        _session_scene={"group-openid": "group"},
+        _session_last_message_id={},
+        _allow_group_proactive_send=True,
+    )
+    plugin.context.get_platform_inst = lambda _: adapter
+
+    async def never_fallback(*args, **kwargs):
+        raise AssertionError("Must bypass AstrBot's implicit plaintext fallback")
+
+    plugin.context.send_message = never_fallback
+    await plugin.store.bind(
+        "qq-main",
+        "qq-main:GroupMessage:group-openid",
+        "member-openid",
+        "Owner",
+        True,
+        "qq_official",
+        location,
+    )
+
+    async def query(location, detail=False):
+        return summarize(
+            location, "iotun", Window.for_days(3), ProviderResult([], 4, datetime.now(SHANGHAI))
+        )
+
+    plugin.service.query = query
+    result = await plugin.monitor.run_manual()
+    assert result.low_dorms == result.send_failures == 1 and result.sent_messages == 0
+    assert "Markdown" in result.message()
+    await plugin.monitor.run()
+    await plugin.monitor.run()  # not suppressed by either failed scheduled delivery
+    assert len(requests) == 3
+    assert all(p["msg_type"] == 2 and not p.get("content") for p in requests)
+    assert await plugin.store._all("SELECT * FROM deliveries") == []
+
+
+async def test_reply_failure_does_not_send_another_error_reply(plugin, monkeypatch, location):
+    import botpy.errors
+
+    from szu_electricity.sharing import encode
+
+    monkeypatch.setenv("ASTRBOT_DISABLE_METRICS", "1")
+    api = API()
+    requests = []
+
+    async def reject(**payload):
+        requests.append(payload)
+        raise botpy.errors.ForbiddenError("markdown permission denied")
+
+    api.post_group_message = reject
+    event = await make_qq_incoming(api)
+    event.message_str = "绑定宿舍 " + encode(location)
+    await plugin.bind_dorm(event)
+    assert len(requests) == 1  # already minimal Markdown, no useful layout retry
+    assert await plugin.store.get_binding(*plugin._identity(event)) is not None
+
+
+async def test_callback_ack_deadline_releases_busy_without_advancing(plugin, monkeypatch):
+    api, event, client, task = await setup_dialog(plugin, monkeypatch)
+    dialog = next(iter(plugin.keyboard.dialogs.values()))
+    data = button(api.posts[-1], "取消")["action"]["data"]
+    cancelled = asyncio.Event()
+
+    async def slow_ack(id, code):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    original = api.on_interaction_result
+    api.on_interaction_result = slow_ack
+    async with asyncio.timeout(3.5):
+        await client.on_interaction_create(interaction(data))
+    assert cancelled.is_set() and not dialog.busy and not dialog.closed
+    assert len(api.posts) == 1
+    api.on_interaction_result = original
+    await client.on_interaction_create(interaction(data, id="next-click"))
+    await task
