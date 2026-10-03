@@ -1,12 +1,30 @@
 """Platform-neutral content plus QQ Markdown/keyboard presentation."""
 
+from urllib.parse import quote
+
 from .analytics import fmt, render
 from .conversation import ReuseSelection, Selection
-from .models import RATE, Report
+from .models import RATE, ElectricityError, Report
 from .qq_messages import MessageView, escape_markdown
 
 
-def choice_card(selection, token: str, revision: int, owner: str, *, keyboard: bool, error=""):
+def command_tag(command: str, label: str) -> str:
+    text, show = quote(command, safe=""), quote(label, safe="")
+    if len(text) > 100 or len(show) > 100:
+        raise ElectricityError("选项指令超过 QQ 长度限制，请缩短机器人唤醒前缀。")
+    return f'<qqbot-cmd-input text="{text}" show="{show}" reference="true" />'
+
+
+def choice_card(
+    selection,
+    token: str,
+    revision: int,
+    owner: str,
+    *,
+    keyboard: bool,
+    error="",
+    command_prefix="/",
+):
     options = []
     controls = []
     if isinstance(selection, ReuseSelection):
@@ -40,14 +58,46 @@ def choice_card(selection, token: str, revision: int, owner: str, *, keyboard: b
     text = selection.prompt()
     if error:
         text = error + "\n" + text
-    markdown = "## 绑定宿舍\n\n" + "\n\n".join(escape_markdown(line) for line in text.splitlines())
-    actions = {}
+    # Both entry points use the same indexed actions, even without a keyboard.
+    items = options + controls
+    actions = {str(i): value for i, (_, value) in enumerate(items)}
+    links = [
+        command_tag(
+            f"{command_prefix}宿舍选项 {token}:{revision}:{i}",
+            "选择" if i < len(options) else label,
+        )
+        for i, (label, _) in enumerate(items)
+    ]
+    if isinstance(selection, ReuseSelection) and len(selection.locations) == 1:
+        heading = "发现已有绑定：" + selection.label(selection.locations[0])
+    else:
+        heading = selection.prompt().splitlines()[0]
+    intro = "## 绑定宿舍\n\n" + escape_markdown(heading)
+    if error:
+        intro += "\n\n" + escape_markdown(error)
+    footer = "点击填入输入框，再发送；也可手输编号。每步 120 秒内回复。"
+    page = next(
+        (
+            line.split(" · ")[0]
+            for line in selection.prompt().splitlines()
+            if line.startswith("第 ")
+        ),
+        "",
+    )
+    footer = (page + "\n\n" if page else "") + footer
+    table = "| 编号 | 选项 | 操作 |\n| --- | --- | --- |\n" + "\n".join(
+        f"| {escape_markdown(value) if i < len(options) else '—'} | {escape_markdown(label).replace(chr(10), ' ').replace(chr(13), ' ')} | {links[i]} |"
+        for i, (label, value) in enumerate(items)
+    )
+    listing = "\n\n".join(
+        f"{escape_markdown(value)}. {escape_markdown(label)} {links[i]}"
+        for i, (label, value) in enumerate(items)
+    )
     rows = []
     if keyboard:
 
-        def button(label, value):
-            index = str(len(actions))
-            actions[index] = value
+        def button(index):
+            label, _ = items[index]
             return {
                 "id": f"szu-{revision}-{index}",
                 "render_data": {
@@ -59,16 +109,21 @@ def choice_card(selection, token: str, revision: int, owner: str, *, keyboard: b
                     "type": 1,
                     "permission": {"type": 0, "specify_user_ids": [owner]},
                     "data": f"szuh:{token}:{revision}:{index}",
-                    "unsupport_tips": "请回复文字编号选择",
+                    "unsupport_tips": "请使用表格指令或回复编号",
                 },
             }
 
         for start in range(0, len(options), 5):
             rows.append(
-                {"buttons": [button(label, value) for label, value in options[start : start + 5]]}
+                {"buttons": [button(i) for i in range(start, min(start + 5, len(options)))]}
             )
-        rows.append({"buttons": [button(label, value) for label, value in controls]})
-    return MessageView(text, markdown, {"content": {"rows": rows}} if rows else None), actions
+        rows.append({"buttons": [button(i) for i in range(len(options), len(items))]})
+    return MessageView(
+        text,
+        intro + "\n\n" + table + "\n\n" + footer,
+        {"content": {"rows": rows}} if rows else None,
+        intro + "\n\n" + listing + "\n\n" + footer,
+    ), actions
 
 
 def detail_view(report: Report, layout="table") -> MessageView:

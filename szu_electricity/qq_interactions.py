@@ -76,7 +76,7 @@ class KeyboardBridge:
                 self.logger.info("QQ keyboard 已就绪：当前连接已订阅互动事件")
             else:
                 self.logger.warning(
-                    "QQ keyboard 等待互动订阅；当前使用 Markdown 编号选项。"
+                    "QQ keyboard 等待互动订阅；当前使用 Markdown 指令表格。"
                     "若机器人已连接，请在机器人管理中重连；仅恢复旧连接不能增加订阅。"
                 )
         hook.ready = ready
@@ -267,6 +267,28 @@ class KeyboardBridge:
             )
             await dialog.process(action, dialog.event, interaction=trigger, claimed=True)
 
+    async def handle_command(self, event, argument, send):
+        parts = argument.split(":")
+        dialog = self.dialogs.get(parts[0]) if len(parts) == 3 and len(argument) <= 100 else None
+        if event.get_platform_name() != "qq_official" or dialog is None or dialog.expired():
+            await send(event, "此选项已失效，请重新发送 /绑定宿舍。")
+            return
+        if (event.get_platform_id(), event.unified_msg_origin, event.get_sender_id()) != (
+            dialog.platform_id,
+            dialog.event.unified_msg_origin,
+            dialog.owner,
+        ):
+            self.logger.debug("QQ 选项指令被拒绝 reason=wrong_owner_or_session")
+            await send(event, "此选项仅限原会话中的绑定发起人使用。")
+            return
+        if parts[1] != str(dialog.revision) or parts[2] not in dialog.actions or dialog.busy:
+            self.logger.debug("QQ 选项指令被拒绝 reason=stale_or_busy")
+            await send(event, "此选项已过期或正在处理，请使用最新选单。")
+            return
+        dialog.busy = True
+        self.logger.debug("QQ 选项指令已接受 trace=%s", correlation(argument))
+        await dialog.process(dialog.actions[parts[2]], event, claimed=True)
+
     @staticmethod
     def _detach(hook):
         hook.active = False
@@ -311,6 +333,10 @@ class BindingDialog:
         self.revision = 0
         self._next_revision = 0
         self.actions = {}
+        config_getter = getattr(bridge.context, "get_config", None)
+        config = config_getter(event.unified_msg_origin) if callable(config_getter) else {}
+        prefixes = config.get("wake_prefix", ["/"])
+        self.command_prefix = next((p for p in prefixes if isinstance(p, str)), "/")
         self.receipt = None
         self.busy = False
         self.closed = False
@@ -330,7 +356,13 @@ class BindingDialog:
         revision = self._next_revision
         keyboard = not self.keyboard_disabled and self.bridge.available(self.event)
         view, actions = choice_card(
-            selection, self.token, revision, self.owner, keyboard=keyboard, error=error
+            selection,
+            self.token,
+            revision,
+            self.owner,
+            keyboard=keyboard,
+            error=error,
+            command_prefix=self.command_prefix,
         )
         receipt = await self.send(event, view, interaction=interaction)
         if self.expired():
@@ -342,9 +374,9 @@ class BindingDialog:
         if keyboard and receipt is not None and not receipt.keyboard:
             self.keyboard_disabled = True
             self.logger.warning(
-                "QQ keyboard 本次流程已降级 status=rejected；继续使用 Markdown 编号选项"
+                "QQ keyboard 本次流程已降级 status=rejected；继续使用 Markdown 指令表格"
             )
-        self.actions = actions if keyboard and not self.keyboard_disabled else {}
+        self.actions = actions
         self.retirer.schedule(old)
 
     async def process(self, text, event, *, interaction=None, claimed=False):
@@ -358,6 +390,8 @@ class BindingDialog:
             self.keep()
             if text.strip() in ("取消", "退出"):
                 await self.finish(event, "已取消绑定，原配置未变更。", interaction=interaction)
+                if interaction is None:
+                    self.retirer.schedule_selection(event, self.event)
                 return
             candidate = copy.deepcopy(self.selection)
             location = candidate.accept(text)
@@ -368,8 +402,12 @@ class BindingDialog:
             if location is not None and location != "new":
                 confirmation = await self.persist(event, location)
                 await self.finish(event, confirmation, interaction=interaction, committed=True)
+                if interaction is None:
+                    self.retirer.schedule_selection(event, self.event)
                 return
             await self.present(event, candidate, interaction=interaction)
+            if interaction is None and not self.expired():
+                self.retirer.schedule_selection(event, self.event)
         except QQSendError as exc:
             self.logger.warning("绑定消息发送失败 committed=%s reason=%s", self.closed, str(exc))
         except Exception as exc:

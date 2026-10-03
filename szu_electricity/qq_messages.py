@@ -8,6 +8,7 @@ import time
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from .models import ElectricityError
 
@@ -80,7 +81,9 @@ def _rejected_feature(exc, feature: str) -> bool:
         )
     if feature == "markdown":
         return (
-            code in {304036, 304061, 40034010, 40034011, 40034124, 40034127} or "markdown" in text
+            code in {304036, 304061, 40034010, 40034011, 40034124, 40034127}
+            or "markdown" in text
+            or "qqbot-cmd" in text
         )
     if feature == "trigger":
         return code in {304103, 40034005, 40034024, 40034025, 40034026, 40034128} or (
@@ -283,22 +286,90 @@ async def notify(adapter, binding, recipients, text, logger) -> SentMessage:
     )
 
 
+@dataclass(frozen=True)
+class UserSelectionMessage:
+    """A validated incoming selection, never a bot receipt or command-supplied ID."""
+
+    platform_id: str
+    peer_id: str
+    message_id: str
+    sent_at: float
+    api: object
+    scene: str = "group"
+
+
 class MessageRetirer:
-    """Recall only our own receipts, within QQ's two-minute time limit."""
+    """Recall bot menus and validated group selections within QQ's time limit."""
 
     def __init__(self, logger, *, clock=time.monotonic, sleep=asyncio.sleep):
         self.logger, self.clock, self.sleep = logger, clock, sleep
         self._locks = defaultdict(asyncio.Lock)
         self._last = {}
         self._pending = set()
+        self._attempted = {}
         self._tasks = set()
 
-    def schedule(self, receipt: SentMessage | None):
+    def schedule_selection(self, event, initial_event):
+        import botpy.message
+
+        if event.get_platform_name() != "qq_official" or event is initial_event:
+            return
+        if (event.get_platform_id(), event.unified_msg_origin, event.get_sender_id()) != (
+            initial_event.get_platform_id(),
+            initial_event.unified_msg_origin,
+            initial_event.get_sender_id(),
+        ):
+            return
+        source = getattr(event.message_obj, "raw_message", None)
+        initial = getattr(initial_event.message_obj, "raw_message", None)
+        if not isinstance(source, botpy.message.GroupMessage):
+            return
+        raw = getattr(source, "raw_data", source)
+        message_id, peer = field(raw, "id"), field(raw, "group_openid")
+        author = field(raw, "author")
+        sender = field(author, "member_openid")
+        if (
+            not message_id
+            or not peer
+            or sender != event.get_sender_id()
+            or peer != event.get_group_id()
+        ):
+            return
+        if message_id == field(getattr(initial, "raw_data", initial), "id"):
+            return
+        timestamp = field(raw, "timestamp")
+        try:
+            timestamp = (
+                datetime.fromisoformat(timestamp) if isinstance(timestamp, str) else timestamp
+            )
+            if not isinstance(timestamp, datetime) or timestamp.tzinfo is None:
+                raise ValueError("missing timestamp")
+            age = (datetime.now(UTC) - timestamp).total_seconds()
+        except (ValueError, TypeError, OverflowError):
+            self.logger.debug("跳过用户选择消息撤回 reason=missing_timestamp")
+            return
+        if not 0 <= age < 120:
+            self.logger.debug("跳过用户选择消息撤回 reason=expired_or_future")
+            return
+        self.schedule(
+            UserSelectionMessage(
+                event.get_platform_id(),
+                str(peer),
+                str(message_id),
+                self.clock() - age,
+                event.bot.api,
+            )
+        )
+
+    def schedule(self, receipt: SentMessage | UserSelectionMessage | None):
         if receipt is None or receipt.scene not in {"group", "c2c"}:
             return
         key = (receipt.platform_id, receipt.scene, receipt.peer_id, receipt.message_id)
-        if key in self._pending:
+        now = self.clock()
+        self._attempted = {key: at for key, at in self._attempted.items() if now - at < 120}
+        if key in self._pending or key in self._attempted:
             return
+        self._attempted[key] = now
         self._pending.add(key)
         task = asyncio.create_task(self._recall(receipt))
         self._tasks.add(task)
@@ -311,16 +382,17 @@ class MessageRetirer:
 
         task.add_done_callback(done)
 
-    async def _recall(self, receipt: SentMessage):
+    async def _recall(self, receipt: SentMessage | UserSelectionMessage):
         from botpy.http import Route
 
+        kind = "user_selection" if isinstance(receipt, UserSelectionMessage) else "bot_menu"
         try:
             async with self._locks[receipt.platform_id]:
                 delay = 0.125 - (self.clock() - self._last.get(receipt.platform_id, float("-inf")))
                 if delay > 0:
                     await self.sleep(delay)
                 if not 0 <= self.clock() - receipt.sent_at < 120:
-                    self.logger.debug("跳过超过撤回时限的选项卡")
+                    self.logger.debug("跳过超过撤回时限的消息 kind=%s", kind)
                     return
                 self._last[receipt.platform_id] = self.clock()
                 path = (
@@ -333,10 +405,18 @@ class MessageRetirer:
                     await receipt.api._http.request(
                         Route("DELETE", path, peer=receipt.peer_id, message=receipt.message_id)
                     )
-                self.logger.debug("上一张选项卡已撤回 scene=%s", receipt.scene)
+                self.logger.debug(
+                    "选项消息已撤回 kind=%s scene=%s trace=%s",
+                    kind,
+                    receipt.scene,
+                    correlation(receipt.message_id),
+                )
         except Exception as exc:
             self.logger.warning(
-                "选项卡撤回失败，不影响绑定流程：%s code=%s", type(exc).__name__, _error_code(exc)
+                "选项消息撤回失败，不影响绑定流程 kind=%s error=%s code=%s",
+                kind,
+                type(exc).__name__,
+                _error_code(exc),
             )
 
     async def drain(self):

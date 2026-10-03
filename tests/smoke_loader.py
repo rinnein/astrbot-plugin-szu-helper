@@ -52,7 +52,7 @@ async def main():
     meta = next(s for s in star_registry if s.name == "astrbot_plugin_szu_helper")
     old = meta.star_cls
     assert old._ready and len(old.scheduler.get_jobs()) == 1
-    assert len(meta.star_handler_full_names) == 6
+    assert len(meta.star_handler_full_names) == 7
     first_hook = old.keyboard.hooks["smoke-qq"]
     assert client.intents & (1 << 26)
     assert client._connection._connect is client.bot_connect

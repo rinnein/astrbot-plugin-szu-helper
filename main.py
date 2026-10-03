@@ -36,7 +36,7 @@ from .szu_electricity.service import ElectricityService
 from .szu_electricity.sharing import decode, encode
 from .szu_electricity.storage import Store
 
-COMMANDS = {"绑定宿舍", "导出宿舍", "用电", "解绑宿舍", "发送低电量预警"}
+COMMANDS = {"绑定宿舍", "导出宿舍", "用电", "解绑宿舍", "发送低电量预警", "宿舍选项"}
 
 
 class SenderSessionFilter(SessionFilter):
@@ -278,6 +278,15 @@ class SzuHelperPlugin(Star):
             await self._select(event, ReuseSelection(locations))
             return
         await self._select(event, Selection(await self.service.catalog()))
+
+    @filter.command("宿舍选项")
+    async def select_dorm_option(self, event: AstrMessageEvent):
+        """处理 QQ 选项表格生成的流程指令。"""
+
+        async def work():
+            await self.keyboard.handle_command(event, self._argument(event), self._reply)
+
+        await self._guard(event, work)
 
     async def _select(self, event, selection: Selection | ReuseSelection):
         session_filter = SenderSessionFilter(event)
