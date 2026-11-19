@@ -19,6 +19,7 @@ from .models import (
     Option,
     ProviderResult,
     Reading,
+    Recharge,
     Window,
     building_name,
     local_now,
@@ -30,6 +31,12 @@ SIMS_BASE = "http://192.168.84.3:9090"
 LIHU_BASE = "http://172.25.100.105:8010/"
 IOTUN_BASE = "https://www.iotun.com"
 MAX_BODY = 2 * 1024 * 1024
+# SIMS' legacy recharge export is an OLE compound file (.xls).
+OLE_HEADER = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+RECHARGE_KWH_COLUMNS = ("充值电量", "购买电量", "购电量")
+RECHARGE_TIME_COLUMNS = ("日期", "时间")
+RECHARGE_YUAN_COLUMNS = ("金额", "费用")
+RECHARGE_SOURCE_COLUMNS = ("方式", "渠道", "形式")
 
 
 def new_client(*, timeout: httpx.Timeout | None = None) -> httpx.AsyncClient:
@@ -214,8 +221,107 @@ def lihu_remaining(page: BeautifulSoup) -> float | None:
     return number(match.group(1)) if match else None
 
 
+def table_rows(page: BeautifulSoup) -> list[list[str]]:
+    """Row cells per table, skipping layout tables wrapping nested record tables."""
+    rows = []
+    for table in page.find_all("table"):
+        for tr in table.find_all("tr"):
+            # Only rows whose nearest table is this one; inner tables collect
+            # their own rows and layout rows with nested tables are not headers.
+            if tr.find_parent("table") is not table:
+                continue
+            cells = tr.find_all(["td", "th"], recursive=False)
+            if any(cell.find("table") for cell in cells):
+                continue
+            rows.append([cell.get_text().strip() for cell in cells])
+    return rows
+
+
+def _cell(row: list[str], index: int | None) -> str:
+    if index is None or index >= len(row):
+        return ""
+    return row[index]
+
+
+def _column(headers: list[str], aliases: tuple[str, ...]) -> int | None:
+    for i, header in enumerate(headers):
+        normalized = header.replace("（", "(").replace("）", ")")
+        if any(alias in normalized for alias in aliases):
+            return i
+    return None
+
+
+def parse_recharges(rows: list[list[str]]) -> list[Recharge]:
+    """Parse recharge records from HTML or spreadsheet rows (column aliases
+    shared by both portals)."""
+    header = next(
+        (i for i, row in enumerate(rows) if _column(row, RECHARGE_KWH_COLUMNS) is not None),
+        None,
+    )
+    if header is None:
+        raise ElectricityError("充值记录表头无法识别。")
+    columns = rows[header]
+    time_col = _column(columns, RECHARGE_TIME_COLUMNS)
+    kwh_col = _column(columns, RECHARGE_KWH_COLUMNS)
+    yuan_col = _column(columns, RECHARGE_YUAN_COLUMNS)
+    source_col = _column(columns, RECHARGE_SOURCE_COLUMNS)
+    if time_col is None:
+        raise ElectricityError("充值记录缺少时间列。")
+    result = []
+    for row in rows[header + 1 :]:
+        raw_time = _cell(row, time_col)
+        if timestamp(raw_time) is None:
+            # A row carrying amounts but no parseable date means the columns
+            # shifted; empty layout rows are skipped silently.
+            if number(_cell(row, kwh_col)) is not None or number(_cell(row, yuan_col)) is not None:
+                raise ElectricityError("充值记录包含无法识别的日期，请重试或检查官网记录。")
+            continue
+        result.append(
+            Recharge(
+                raw_time.strip(),
+                number(_cell(row, kwh_col)),
+                number(_cell(row, yuan_col)),
+                (_cell(row, source_col).strip() or None) if source_col is not None else None,
+                "channel",
+            )
+        )
+    result.sort(
+        key=lambda r: timestamp(r.time) or datetime.min.replace(tzinfo=SHANGHAI), reverse=True
+    )
+    return result
+
+
+def _xls_text(value) -> str:
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def parse_sims_recharge_bytes(content: bytes) -> list[Recharge]:
+    # Some installations return an HTML table with an .xls content type.
+    text = content.decode("gb18030", errors="replace")
+    if "<table" in text.lower():
+        return parse_recharges(table_rows(BeautifulSoup(text, "html.parser")))
+    if content.startswith(OLE_HEADER):
+        try:
+            import xlrd
+        except ImportError as exc:
+            raise ElectricityError("解析充值 Excel 需要安装 xlrd 依赖。") from exc
+        try:
+            book = xlrd.open_workbook(file_contents=content)
+        except Exception as exc:
+            raise ElectricityError("无法解析充值 Excel 文件。") from exc
+        for sheet in book.sheets():
+            rows = [[_xls_text(value) for value in row] for row in sheet.get_rows()]
+            if any(_column(row, RECHARGE_KWH_COLUMNS) is not None for row in rows):
+                return parse_recharges(rows)
+        raise ElectricityError("充值 Excel 缺少记录列。")
+    raise ElectricityError("无法识别充值记录格式。")
+
+
 class OfficialProvider:
     name = "official"
+    supports_recharges = True
 
     def __init__(self, client_factory: Callable = new_client, *, logger=None):
         self.client_factory = client_factory
@@ -261,9 +367,23 @@ class OfficialProvider:
                     balance, observed = result.remaining, result.observed_at
         return ProviderResult(rows, balance, observed)
 
-    async def _sims(
-        self, client: httpx.AsyncClient, location: Location, window: Window
-    ) -> ProviderResult:
+    async def recharges(self, location: Location, window: Window) -> list[Recharge]:
+        self.logger.debug(
+            "official: recharges backend=%s days=%s",
+            "lihu" if location.areaId == "xili-lihuo-phase2" else "sims",
+            window.days,
+        )
+        if location.areaId == "xili-lihuo-phase2":
+            return await self._lihu_recharges(location, window)
+        return await self._sims_recharges(location, window)
+
+    async def _sims_room(
+        self, client: httpx.AsyncClient, location: Location
+    ) -> tuple[str, str, BeautifulSoup, dict[str, str]]:
+        """Station selection and room lookup shared by usage and recharge queries.
+
+        Returns the client IP, the room page URL, its parsed page, and hidden fields.
+        """
         client_ip = SIMS_CLIENTS.get(location.areaId)
         if client_ip is None:
             raise ElectricityError("未知的 SIMS 宿舍区域。")
@@ -287,7 +407,13 @@ class OfficialProvider:
         hidden = fields(room)
         if not hidden.get("roomId"):
             raise ElectricityError("未找到该宿舍，请检查楼栋和宿舍号。")
-        query_url = action(room, str(response.url), "/cgcSims/selectList.do")
+        return client_ip, str(response.url), room, hidden
+
+    async def _sims(
+        self, client: httpx.AsyncClient, location: Location, window: Window
+    ) -> ProviderResult:
+        client_ip, room_url, room, hidden = await self._sims_room(client, location)
+        query_url = action(room, room_url, "/cgcSims/selectList.do")
         page = html(
             await post(
                 client,
@@ -308,9 +434,32 @@ class OfficialProvider:
         )
         return ProviderResult(parse_sims(page, location.roomName))
 
-    async def _lihu(
-        self, client: httpx.AsyncClient, location: Location, window: Window
-    ) -> ProviderResult:
+    async def _sims_recharges(self, location: Location, window: Window) -> list[Recharge]:
+        result = []
+        for chunk in window.chunks():
+            async with self.client_factory() as client:
+                client_ip, _, _, hidden = await self._sims_room(client, location)
+                data = await request(
+                    client,
+                    "GET",
+                    f"{SIMS_BASE}/cgcSims/selectList.do",
+                    params={
+                        "type": "3",
+                        "client": client_ip,
+                        "roomId": hidden["roomId"],
+                        "roomName": location.roomName,
+                        "beginTime": str(chunk.begin),
+                        "endTime": str(chunk.end),
+                    },
+                )
+                result.extend(parse_sims_recharge_bytes(data.content))
+        return result
+
+    async def _lihu_landing(
+        self, client: httpx.AsyncClient, location: Location, radio: str, record_page: str
+    ):
+        """Room postback chain shared by usage and recharge queries; returns
+        the record page URL and its landing page."""
         digits = location.roomName
         if not re.fullmatch(r"[0-9]{3,5}", digits):
             raise ElectricityError("丽湖二期宿舍号应为包含楼层的 3～5 位数字，例如 501。")
@@ -355,13 +504,19 @@ class OfficialProvider:
                 "drlouming": location.buildingId,
                 "drceng": floor,
                 "drfangjian": matches[0].id,
-                "radio": "usedR",
+                "radio": radio,
                 "ImageButton1.x": "20",
                 "ImageButton1.y": "10",
             },
         )
         landing = html(response)
-        url = action(landing, str(response.url), urljoin(LIHU_BASE, "usedRecord.aspx"))
+        url = action(landing, str(response.url), urljoin(LIHU_BASE, record_page))
+        return url, landing
+
+    async def _lihu(
+        self, client: httpx.AsyncClient, location: Location, window: Window
+    ) -> ProviderResult:
+        url, landing = await self._lihu_landing(client, location, "usedR", "usedRecord.aspx")
         first = html(
             await post(
                 client,
@@ -401,9 +556,50 @@ class OfficialProvider:
             rows, remaining, datetime.now(SHANGHAI) if remaining is not None else None
         )
 
+    async def _lihu_recharges(self, location: Location, window: Window) -> list[Recharge]:
+        result = []
+        for chunk in window.chunks():
+            async with self.client_factory() as client:
+                url, landing = await self._lihu_landing(client, location, "buyR", "buyRecord.aspx")
+                first = html(
+                    await post(
+                        client,
+                        url,
+                        landing,
+                        {
+                            "txtstart": str(chunk.begin),
+                            "txtend": str(chunk.end),
+                            "btnser": "查询",
+                        },
+                    )
+                )
+                match = re.search(r"共\s*(\d+)\s*页", first.get_text(" ", strip=True))
+                count = int(match.group(1)) if match else 1
+                if not 1 <= count <= 100:
+                    raise ElectricityError("丽湖接口分页数量异常。")
+                rows = table_rows(first)
+                for n in range(2, count + 1):
+                    page = html(
+                        await request(
+                            client,
+                            "GET",
+                            url,
+                            params={
+                                "p": str(n),
+                                "txtstart": str(chunk.begin),
+                                "txtend": str(chunk.end),
+                            },
+                            headers={"Referer": url},
+                        )
+                    )
+                    rows.extend(table_rows(page))
+                result.extend(parse_recharges(rows))
+        return result
+
 
 class IotunProvider:
     name = "iotun"
+    supports_recharges = False
 
     def __init__(self, client_factory: Callable = new_iotun_client, *, logger=None):
         self.client_factory = client_factory
@@ -444,6 +640,11 @@ class IotunProvider:
 
     async def catalog(self) -> Catalog:
         return iotun_catalog(await self._get("/api/buildings"))
+
+    async def recharges(self, location: Location, window: Window) -> list[Recharge]:
+        # The service skips this path via supports_recharges; this guard only
+        # protects direct calls.
+        raise ElectricityError("iotun 数据源不提供充值记录。")
 
     async def query(self, location: Location, window: Window) -> ProviderResult:
         group, bid = iotun_target(location)

@@ -259,4 +259,86 @@ async def test_iotun_sims_retains_actual_old_meter_date():
     window = Window.for_days(3, now.date())
     result = await provider.query(location, window)
     report = summarize(location, "iotun", window, result, now=now)
-    assert report.expired and report.unavailable_reason == "stale"
+    # The meter date is retained (no fabricated freshness); staleness is a
+    # display note now — the balance itself still projects and warns.
+    assert report.observed_at == datetime(2026, 9, 29, 23, 59, tzinfo=SHANGHAI)
+    assert report.expired and report.unavailable_reason is None
+    assert report.remaining == 88 and report.effective_remaining == 88
+
+
+async def test_iotun_recharges_are_not_supported():
+    provider = IotunProvider(
+        factory(lambda req: httpx.Response(200, json={"ok": True, "data": {}}))
+    )
+    with pytest.raises(ElectricityError, match="iotun"):
+        await provider.recharges(
+            Location("xili", "xili-lihuo-phase2", "01", "梧桐树", "501"), Window.for_days(3)
+        )
+
+
+def recharge_table():
+    return """
+    <table><tr><td>布局外壳</td><td><table>
+      <tr><th>日期</th><th>充值电量（度）</th><th>金额（元）</th><th>方式</th></tr>
+      <tr><td>2026-10-03 09:15:00</td><td>10.5</td><td>7.35</td><td>渠道</td></tr>
+      <tr><td>2026-10-05</td><td></td><td>69.979</td><td>渠道</td></tr>
+      <tr><td>2026-10-02</td><td>5</td><td></td><td>个人</td></tr>
+    </table></td></tr></table>
+    """
+
+
+def test_parse_recharges_columns_aliases_and_ordering():
+    from bs4 import BeautifulSoup
+
+    from szu_electricity.providers import parse_recharges, table_rows
+
+    recharges = parse_recharges(table_rows(BeautifulSoup(recharge_table(), "html.parser")))
+    # Newest first; date-only rows sort by their day.
+    assert [r.time for r in recharges] == ["2026-10-05", "2026-10-03 09:15:00", "2026-10-02"]
+    assert recharges[0].kwh is None and recharges[0].yuan == 69.979
+    assert recharges[1].kwh == 10.5 and recharges[1].source == "渠道"
+    assert recharges[2].kwh == 5
+
+
+def test_parse_recharges_rejects_unparseable_dates():
+    from szu_electricity.providers import parse_recharges
+
+    rows = [["日期", "充值电量"], ["2026-10-05", "3"], ["垃圾日期", "9"]]
+    with pytest.raises(ElectricityError, match="无法识别的日期"):
+        parse_recharges(rows)
+    with pytest.raises(ElectricityError, match="表头无法识别"):
+        parse_recharges([["没有", "这些列"], ["1", "2"]])
+
+
+async def test_official_sims_recharges_query_flow(location):
+    def handler(req):
+        if req.method == "GET" and "task=station" in str(req.url):
+            return response(
+                '<form action="login.do"><select name="buildingId"><option value="54">山茶斋</option></select></form>'
+            )
+        if req.method == "POST":
+            return response(
+                '<form action="selectList.do"><input type="hidden" name="roomId" value="42"></form>'
+            )
+        assert req.url.params["type"] == "3"
+        assert req.url.params["roomId"] == "42"
+        assert req.url.params["beginTime"] == "2026-10-01"
+        return response(recharge_table())
+
+    provider = OfficialProvider(factory(handler))
+    recharges = await provider.recharges(location, Window.for_days(3, date(2026, 10, 3)))
+    assert [r.time for r in recharges] == ["2026-10-05", "2026-10-03 09:15:00", "2026-10-02"]
+
+
+async def test_sims_recharge_bytes_html_and_broken_xls():
+
+    from szu_electricity.providers import parse_sims_recharge_bytes
+
+    content = recharge_table().encode("gb18030")
+    recharges = parse_sims_recharge_bytes(content)
+    assert len(recharges) == 3
+    # OLE header but not a real workbook → safe error instead of a crash.
+    with pytest.raises(ElectricityError, match="无法解析充值 Excel"):
+        parse_sims_recharge_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"garbage" * 40)
+    with pytest.raises(ElectricityError, match="无法识别充值记录格式"):
+        parse_sims_recharge_bytes(b"plain text without tables")

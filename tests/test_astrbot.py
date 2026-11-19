@@ -33,7 +33,13 @@ except ModuleNotFoundError:
 from astrbot.core.utils.session_waiter import USER_SESSIONS
 
 from szu_electricity.analytics import summarize
-from szu_electricity.models import SHANGHAI, Binding, ProviderResult, Window
+from szu_electricity.models import (
+    DEFAULT_LOW_POWER_THRESHOLD,
+    SHANGHAI,
+    Binding,
+    ProviderResult,
+    Window,
+)
 from szu_electricity.sharing import encode
 
 
@@ -189,7 +195,11 @@ async def test_message_mentions_and_unsupported_platform(plugin, location):
     plugin.monitor.threshold = 7.5
     binding = Binding(1, "bot", "bot:GroupMessage:group", "42", "User", True, "aiocqhttp", location)
     report = summarize(
-        location, "official", Window.for_days(3), ProviderResult([], 4, datetime.now(SHANGHAI))
+        location,
+        "official",
+        Window.for_days(3),
+        ProviderResult([], 4, datetime.now(SHANGHAI)),
+        threshold=7.5,
     )
     assert await plugin._notify([binding], report)
     assert str(sent[0][1].chain[0].qq) == "42"
@@ -246,7 +256,7 @@ async def test_manual_alert_admin_only_and_schedule_unchanged(plugin, location):
     assert not permissions[0].filter(member, plugin.config)
     calls = []
 
-    async def query(location, detail=False):
+    async def query(location, detail=False, threshold=DEFAULT_LOW_POWER_THRESHOLD):
         calls.append(detail)
         return summarize(
             location,
@@ -401,7 +411,8 @@ async def test_all_network_features_follow_selected_source(tmp_path, monkeypatch
         assert all(host == "www.iotun.com" for host, _, _ in requests)
         assert [params["days"] for _, path, params in requests if path == "/api/status"] == [
             "3",
-            "31",
+            "20",
+            "8",
         ]
         assert await plugin.store.catalog("official") is not None
         assert await plugin.store.catalog("iotun") is not None
@@ -602,7 +613,7 @@ async def test_query_and_error_replies_mention_only_initiator(plugin, location):
     await bind_in_session(plugin, location, group="group1", sender="2")
     from datetime import datetime
 
-    async def query(location, detail=False):
+    async def query(location, detail=False, threshold=DEFAULT_LOW_POWER_THRESHOLD):
         return summarize(
             location, "official", Window.for_days(3), ProviderResult([], 4, datetime.now(SHANGHAI))
         )
@@ -639,7 +650,7 @@ async def test_batch_alerts_mention_owners_but_receipts_mention_admin(plugin, lo
     for sender, group in [("1", "group1"), ("2", "group1"), ("3", "group2")]:
         await bind_in_session(plugin, location, group=group, sender=sender)
 
-    async def query(location, detail=False):
+    async def query(location, detail=False, threshold=DEFAULT_LOW_POWER_THRESHOLD):
         return summarize(
             location, "official", Window.for_days(3), ProviderResult([], 4, datetime.now(SHANGHAI))
         )
@@ -719,7 +730,7 @@ async def test_qqofficial_428_real_adapter_sends_group_and_private_alerts(
     ]:
         await plugin.store.bind("qq-main", origin, user, user, is_group, "qq_official", location)
 
-    async def query(location, detail=False):
+    async def query(location, detail=False, threshold=DEFAULT_LOW_POWER_THRESHOLD):
         return summarize(
             location, "official", Window.for_days(3), ProviderResult([], 4, datetime.now(SHANGHAI))
         )
@@ -758,7 +769,7 @@ async def test_qqofficial_missing_context_is_not_reported_as_sent(plugin, locati
     plugin.context.send_message = must_not_send
     await bind_in_session(plugin, location, group="group1")
 
-    async def query(location, detail=False):
+    async def query(location, detail=False, threshold=DEFAULT_LOW_POWER_THRESHOLD):
         return summarize(
             location, "official", Window.for_days(3), ProviderResult([], 4, datetime.now(SHANGHAI))
         )
@@ -776,7 +787,7 @@ async def test_missing_delivery_platform_is_explained(plugin, location):
     plugin.context.get_platform_inst = lambda _: None
     await bind_in_session(plugin, location)
 
-    async def query(location, detail=False):
+    async def query(location, detail=False, threshold=DEFAULT_LOW_POWER_THRESHOLD):
         return summarize(
             location, "official", Window.for_days(3), ProviderResult([], 4, datetime.now(SHANGHAI))
         )

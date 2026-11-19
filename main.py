@@ -23,7 +23,14 @@ from astrbot.core.utils.session_waiter import (
 from .szu_electricity.analytics import fmt, render
 from .szu_electricity.config import Settings
 from .szu_electricity.conversation import ReuseSelection, Selection
-from .szu_electricity.models import SHANGHAI, Binding, ElectricityError, Location, Report
+from .szu_electricity.models import (
+    SHANGHAI,
+    YUAN_PER_KWH,
+    Binding,
+    ElectricityError,
+    Location,
+    Report,
+)
 from .szu_electricity.monitor import Monitor
 from .szu_electricity.presentation import detail_view
 from .szu_electricity.providers import IotunProvider, OfficialProvider
@@ -409,7 +416,15 @@ class SzuHelperPlugin(Star):
             raise ElectricityError(
                 f"当前 {platform} 适配器声明不支持主动消息，请检查 AstrBot 版本及平台配置。"
             )
-        text = f"宿舍 {report.location.buildingName} {report.location.roomName} 剩余电量 {fmt(report.remaining)} 度，低于 {self.monitor.threshold:g} 度，请及时充值。"
+        effective = report.effective_remaining
+        lines = [
+            f"宿舍 {report.location.buildingName} {report.location.roomName}：{report.warning_reason}",
+            f"当前有效余额 {fmt(effective)} 度（折算 {fmt(effective * YUAN_PER_KWH)} 元）。",
+        ]
+        if report.expired:
+            observed = report.observed_at.date() if report.observed_at else "未知"
+            lines.append(f"读数日期 {observed}，余额按日均用量推算至当前时刻。")
+        text = "\n".join(lines)
         if platform == "qq_official":
             await qq_notify(
                 adapter, bindings[0], [b.sender_id for b in bindings], text, self.logger

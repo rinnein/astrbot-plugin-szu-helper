@@ -315,7 +315,7 @@ async def test_markdown_table_fallback_and_transport_errors(plugin, monkeypatch,
     assert receipt.message_id and len(calls) == 2
     assert calls[0]["msg_type"] == calls[1]["msg_type"] == 2
     assert "content" not in calls[0] and "content" not in calls[1]
-    assert "**当前电量**" in calls[1]["markdown"]["content"]
+    assert "**读数电量**" in calls[1]["markdown"]["content"]
     calls.clear()
 
     async def unavailable(**payload):
@@ -491,14 +491,14 @@ async def test_detail_command_uses_configured_markdown_layout(plugin, monkeypatc
     from datetime import datetime
 
     from szu_electricity.analytics import summarize
-    from szu_electricity.models import SHANGHAI, ProviderResult, Window
+    from szu_electricity.models import DEFAULT_LOW_POWER_THRESHOLD, SHANGHAI, ProviderResult, Window
 
     monkeypatch.setenv("ASTRBOT_DISABLE_METRICS", "1")
     api = API()
     event = await make_qq_incoming(api)
     await plugin.store.bind(*plugin._identity(event), "Owner", True, "qq_official", location)
 
-    async def query(location, detail=False):
+    async def query(location, detail=False, threshold=DEFAULT_LOW_POWER_THRESHOLD):
         return summarize(
             location,
             "iotun",
@@ -514,7 +514,7 @@ async def test_detail_command_uses_configured_markdown_layout(plugin, monkeypatc
     assert "content" not in api.posts[-1]
     plugin.config["detail_layout"] = "list"
     await plugin.electricity(event)
-    assert "**当前电量**" in api.posts[-1]["markdown"]["content"]
+    assert "**读数电量**" in api.posts[-1]["markdown"]["content"]
     assert "| 指标 |" not in api.posts[-1]["markdown"]["content"]
     event.message_str = "用电"
     await plugin.electricity(event)
@@ -817,7 +817,7 @@ async def test_all_qq_command_outputs_keep_mentions_in_markdown(plugin, monkeypa
     from datetime import datetime
 
     from szu_electricity.analytics import summarize
-    from szu_electricity.models import SHANGHAI, ProviderResult, Window
+    from szu_electricity.models import DEFAULT_LOW_POWER_THRESHOLD, SHANGHAI, ProviderResult, Window
     from szu_electricity.sharing import encode
 
     monkeypatch.setenv("ASTRBOT_DISABLE_METRICS", "1")
@@ -830,7 +830,7 @@ async def test_all_qq_command_outputs_keep_mentions_in_markdown(plugin, monkeypa
     # Only the mention prefix is separate; the share code remains byte-for-byte identical.
     assert api.posts[-1]["markdown"]["content"].partition("\n")[2] == encode(location)
 
-    async def query(location, detail=False):
+    async def query(location, detail=False, threshold=DEFAULT_LOW_POWER_THRESHOLD):
         return summarize(
             location, "iotun", Window.for_days(3), ProviderResult([], 88, datetime.now(SHANGHAI))
         )
@@ -865,7 +865,7 @@ async def test_qq_markdown_refusal_never_calls_adapter_fallback_or_marks_deliver
     from botpy.api import BotAPI
 
     from szu_electricity.analytics import summarize
-    from szu_electricity.models import SHANGHAI, ProviderResult, Window
+    from szu_electricity.models import DEFAULT_LOW_POWER_THRESHOLD, SHANGHAI, ProviderResult, Window
 
     requests = []
 
@@ -897,7 +897,7 @@ async def test_qq_markdown_refusal_never_calls_adapter_fallback_or_marks_deliver
         location,
     )
 
-    async def query(location, detail=False):
+    async def query(location, detail=False, threshold=DEFAULT_LOW_POWER_THRESHOLD):
         return summarize(
             location, "iotun", Window.for_days(3), ProviderResult([], 4, datetime.now(SHANGHAI))
         )

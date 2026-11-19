@@ -4,7 +4,7 @@ from urllib.parse import quote
 
 from .analytics import fmt, render
 from .conversation import ReuseSelection, Selection
-from .models import RATE, ElectricityError, Report
+from .models import YUAN_PER_KWH, ElectricityError, Report
 from .qq_messages import MessageView, escape_markdown
 
 
@@ -127,13 +127,19 @@ def choice_card(
 
 
 def detail_view(report: Report, layout="table") -> MessageView:
+    effective = report.effective_remaining
     rows = [
-        ("当前电量", fmt(report.remaining) + " 度"),
+        ("读数电量", fmt(report.remaining) + " 度"),
+        ("观测后充值", "+" + fmt(report.recharge_credit) + " 度"),
+        ("观测至今估算", "-" + fmt(report.elapsed_used) + " 度"),
+        ("有效余额", fmt(effective) + " 度"),
         (
             "折算余额",
-            fmt(report.remaining * RATE if report.remaining is not None else None) + " 元",
+            fmt(effective * YUAN_PER_KWH if effective is not None else None) + " 元",
         ),
-        ("日均用电", fmt(report.daily_average) + " 度/天"),
+        ("近 7 天日均", fmt(report.weekly_average) + " 度/天"),
+        ("近 31 天日均", fmt(report.monthly_average) + " 度/天"),
+        ("预测日均", fmt(report.prediction_average) + " 度/天"),
         (
             "预计可用",
             "暂无法估算" if report.estimated_days is None else f"约 {report.estimated_days:.1f} 天",
@@ -147,8 +153,9 @@ def detail_view(report: Report, layout="table") -> MessageView:
     table = "| 指标 | 数值 |\n| --- | --- |\n" + "\n".join(
         f"| {label} | {escape_markdown(value)} |" for label, value in rows
     )
-    # Keep the authoritative date/window/warning text from the plain renderer.
-    footer = "\n\n".join(escape_markdown(line) for line in render(report, True).splitlines()[5:])
+    # Keep the authoritative date/window/warning text from the plain renderer;
+    # its detail lines 0-7 are already shown as rows above.
+    footer = "\n\n".join(escape_markdown(line) for line in render(report, True).splitlines()[8:])
     fallback = title + "\n\n" + listing + "\n\n" + footer
     markdown = title + "\n\n" + table + "\n\n" + footer if layout == "table" else fallback
     return MessageView(

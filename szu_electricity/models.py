@@ -8,10 +8,9 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-RATE = 0.61
+YUAN_PER_KWH = 0.69979
 DEFAULT_LOW_POWER_THRESHOLD = 5.0
 CACHE_TTL_SECONDS = 2 * 60 * 60
-MAX_READING_AGE = timedelta(hours=48)
 
 
 class ElectricityError(Exception):
@@ -163,29 +162,29 @@ class Reading:
     daily: float | None = None
 
 
+@dataclass(frozen=True)
+class Recharge:
+    # Raw portal text: date-only rows follow end-of-day semantics downstream.
+    time: str
+    kwh: float | None = None
+    yuan: float | None = None
+    source: str | None = None
+    source_kind: str = "channel"
+
+
+@dataclass(frozen=True)
+class Check:
+    """A per-date fetch record; the day stays fresh until its expiry instant."""
+
+    fetched_at: float
+    expires_at: float
+
+
 @dataclass
 class ProviderResult:
     readings: list[Reading]
     remaining: float | None = None
     observed_at: datetime | None = None
-
-    def to_dict(self) -> dict:
-        return {
-            "readings": [{**asdict(row), "at": row.at.isoformat()} for row in self.readings],
-            "remaining": self.remaining,
-            "observed_at": self.observed_at.isoformat() if self.observed_at else None,
-        }
-
-    @classmethod
-    def from_dict(cls, value: dict) -> ProviderResult:
-        return cls(
-            [
-                Reading(**{**row, "at": datetime.fromisoformat(row["at"])})
-                for row in value["readings"]
-            ],
-            value["remaining"],
-            datetime.fromisoformat(value["observed_at"]) if value["observed_at"] else None,
-        )
 
 
 @dataclass(frozen=True)
@@ -193,14 +192,29 @@ class Report:
     location: Location
     source: str
     window: Window
+    # Portal balance as measured, and the instant it was observed.
     remaining: float | None
     observed_at: datetime | None
-    expired: bool
+    # Correction between the reading instant and now: recharges counted after
+    # the reading, estimated usage since then, and the resulting balance. It
+    # may go negative — the school allows overdraft.
+    recharge_credit: float
+    elapsed_used: float
+    effective_remaining: float | None
+    # Covered-day weighted windows and their blended daily estimate.
+    weekly_average: float | None
+    monthly_average: float | None
+    prediction_average: float | None
+    estimated_days: float | None
+    # Display statistics for the queried window.
     total_used: float | None
     daily_average: float | None
     valid_days: int
-    estimated_days: float | None
+    expired: bool
+    warning_reason: str | None
+    # No balance anchor at all; expired readings still warn and project.
     unavailable_reason: str | None = None
+    refresh_error: str | None = None
 
 
 @dataclass(frozen=True)

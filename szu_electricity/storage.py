@@ -3,12 +3,43 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
 
-from .models import CACHE_TTL_SECONDS, Binding, Catalog, Location, ProviderResult, Report, Window
+from .models import (
+    SHANGHAI,
+    Binding,
+    Catalog,
+    Check,
+    Location,
+    Reading,
+    Recharge,
+    Report,
+    timestamp,
+)
+
+RETAIN_DAYS = 62
+
+
+@dataclass
+class RoomState:
+    """Per-dorm cached history: full readings, recharges, and fetch marks."""
+
+    readings: list[Reading] = field(default_factory=list)
+    recharges: list[Recharge] = field(default_factory=list)
+    usage_checks: dict[str, Check] = field(default_factory=dict)
+    recharge_checks: dict[str, Check] = field(default_factory=dict)
+    balance: float | None = None
+    balance_observed_at: datetime | None = None
+    usage_updated_at: float | None = None
+    recharge_updated_at: float | None = None
+    retry_after: float = 0.0
+    error: str | None = None
+    recharge_error: str | None = None
+    recharge_retry_after: float = 0.0
 
 
 class Store:
@@ -44,13 +75,31 @@ class Store:
             CREATE TABLE IF NOT EXISTS catalogs (
                 source TEXT PRIMARY KEY, fetched_at REAL NOT NULL, value TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS query_cache (
-                source TEXT NOT NULL, dorm_key TEXT NOT NULL,
-                begin_date TEXT NOT NULL, end_date TEXT NOT NULL,
-                fetched_at REAL NOT NULL, value TEXT NOT NULL,
-                PRIMARY KEY(source,dorm_key,begin_date,end_date)
+            CREATE TABLE IF NOT EXISTS rooms (
+                dorm_key TEXT NOT NULL, source TEXT NOT NULL,
+                balance REAL, balance_observed_at TEXT,
+                usage_updated_at REAL, recharge_updated_at REAL,
+                retry_after REAL NOT NULL DEFAULT 0, error TEXT,
+                recharge_error TEXT, recharge_retry_after REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY(dorm_key, source)
             );
-            PRAGMA user_version=1;
+            CREATE TABLE IF NOT EXISTS readings (
+                dorm_key TEXT NOT NULL, source TEXT NOT NULL, date TEXT NOT NULL,
+                observed_at TEXT, remaining REAL, cumulative REAL, daily REAL,
+                PRIMARY KEY(dorm_key, source, date)
+            );
+            CREATE TABLE IF NOT EXISTS recharges (
+                dorm_key TEXT NOT NULL, source TEXT NOT NULL, time TEXT NOT NULL,
+                kwh REAL, yuan REAL, source_kind TEXT NOT NULL,
+                PRIMARY KEY(dorm_key, source, time)
+            );
+            CREATE TABLE IF NOT EXISTS checks (
+                dorm_key TEXT NOT NULL, source TEXT NOT NULL, kind TEXT NOT NULL,
+                date TEXT NOT NULL, fetched_at REAL NOT NULL, expires_at REAL NOT NULL,
+                PRIMARY KEY(dorm_key, source, kind, date)
+            );
+            DROP TABLE IF EXISTS query_cache;
+            PRAGMA user_version=2;
         """)
         await self.db.commit()
 
@@ -171,50 +220,125 @@ class Store:
             )
             await self.db.commit()
 
-    async def cached_query(
-        self, source: str, location: Location, window: Window
-    ) -> tuple[float, ProviderResult] | None:
+    async def load_room(self, source: str, dorm_key: str) -> RoomState:
         async with self.lock:
+            room = RoomState()
             rows = await self._all(
-                "SELECT fetched_at,value FROM query_cache WHERE source=? AND dorm_key=? AND begin_date=? AND end_date=?",
-                (source, location.key, str(window.begin), str(window.end)),
+                "SELECT * FROM rooms WHERE dorm_key=? AND source=?", (dorm_key, source)
             )
-            if not rows:
-                return None
-            try:
-                return rows[0]["fetched_at"], ProviderResult.from_dict(json.loads(rows[0]["value"]))
-            except (ValueError, KeyError, TypeError):
-                return None
+            if rows:
+                row = rows[0]
+                room.balance = row["balance"]
+                room.balance_observed_at = (
+                    timestamp(row["balance_observed_at"]) if row["balance_observed_at"] else None
+                )
+                room.usage_updated_at = row["usage_updated_at"]
+                room.recharge_updated_at = row["recharge_updated_at"]
+                room.retry_after = row["retry_after"] or 0.0
+                room.error = row["error"]
+                room.recharge_error = row["recharge_error"]
+                room.recharge_retry_after = row["recharge_retry_after"] or 0.0
+            for row in await self._all(
+                "SELECT * FROM readings WHERE dorm_key=? AND source=? ORDER BY date",
+                (dorm_key, source),
+            ):
+                if not row["observed_at"]:
+                    continue
+                at = timestamp(row["observed_at"])
+                if at is None:
+                    continue
+                room.readings.append(Reading(at, row["remaining"], row["cumulative"], row["daily"]))
+            for row in await self._all(
+                "SELECT * FROM recharges WHERE dorm_key=? AND source=?", (dorm_key, source)
+            ):
+                room.recharges.append(
+                    Recharge(row["time"], row["kwh"], row["yuan"], None, row["source_kind"])
+                )
+            for row in await self._all(
+                "SELECT * FROM checks WHERE dorm_key=? AND source=?", (dorm_key, source)
+            ):
+                check = Check(row["fetched_at"], row["expires_at"])
+                target = room.usage_checks if row["kind"] == "usage" else room.recharge_checks
+                target[row["date"]] = check
+            return room
 
-    async def save_query(
-        self,
-        source: str,
-        location: Location,
-        window: Window,
-        data: ProviderResult,
-        fetched_at: float,
-    ):
+    async def save_room(self, source: str, dorm_key: str, room: RoomState, now: float):
+        """Replace the dorm's whole row set in one transaction, pruning history
+        older than the retention window. `now` shares the service clock so the
+        cutoff follows the same timeline as the stored dates."""
+        cutoff = (
+            datetime.fromtimestamp(now, SHANGHAI).date() - timedelta(days=RETAIN_DAYS - 1)
+        ).isoformat()
         async with self.lock:
             assert self.db is not None
-            await self.db.execute(
-                "DELETE FROM query_cache WHERE fetched_at<=? OR fetched_at>?",
-                (fetched_at - CACHE_TTL_SECONDS, fetched_at),
-            )
-            await self.db.execute(
-                "INSERT OR REPLACE INTO query_cache VALUES(?,?,?,?,?,?)",
-                (
-                    source,
-                    location.key,
-                    str(window.begin),
-                    str(window.end),
-                    fetched_at,
-                    json.dumps(data.to_dict(), ensure_ascii=False),
-                ),
-            )
-            await self.db.commit()
+            try:
+                await self.db.execute(
+                    "DELETE FROM readings WHERE dorm_key=? AND source=?", (dorm_key, source)
+                )
+                await self.db.execute(
+                    "DELETE FROM recharges WHERE dorm_key=? AND source=?", (dorm_key, source)
+                )
+                await self.db.execute(
+                    "DELETE FROM checks WHERE dorm_key=? AND source=?", (dorm_key, source)
+                )
+                await self.db.execute(
+                    "INSERT OR REPLACE INTO rooms VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        dorm_key,
+                        source,
+                        room.balance,
+                        room.balance_observed_at.isoformat() if room.balance_observed_at else None,
+                        room.usage_updated_at,
+                        room.recharge_updated_at,
+                        room.retry_after,
+                        room.error,
+                        room.recharge_error,
+                        room.recharge_retry_after,
+                    ),
+                )
+                await self.db.executemany(
+                    "INSERT OR REPLACE INTO readings VALUES(?,?,?,?,?,?,?)",
+                    [
+                        (
+                            dorm_key,
+                            source,
+                            reading.at.date().isoformat(),
+                            reading.at.isoformat(),
+                            reading.remaining,
+                            reading.cumulative,
+                            reading.daily,
+                        )
+                        for reading in room.readings
+                    ],
+                )
+                await self.db.executemany(
+                    "INSERT OR REPLACE INTO recharges VALUES(?,?,?,?,?,?)",
+                    [
+                        (dorm_key, source, r.time, r.kwh, r.yuan, r.source_kind)
+                        for r in room.recharges
+                    ],
+                )
+                await self.db.executemany(
+                    "INSERT OR REPLACE INTO checks VALUES(?,?,?,?,?,?)",
+                    [
+                        (dorm_key, source, kind, day, check.fetched_at, check.expires_at)
+                        for kind, marks in (
+                            ("usage", room.usage_checks),
+                            ("recharge", room.recharge_checks),
+                        )
+                        for day, check in marks.items()
+                    ],
+                )
+                # Global retention: rows of dorms that stopped being queried age out too.
+                await self.db.execute("DELETE FROM readings WHERE date<?", (cutoff,))
+                await self.db.execute("DELETE FROM checks WHERE date<?", (cutoff,))
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
 
     async def observe(self, report: Report, threshold: float) -> int | None:
-        if report.expired or report.remaining is None or report.observed_at is None:
+        if report.effective_remaining is None or report.observed_at is None:
             return None
         async with self.lock:
             assert self.db is not None
@@ -224,7 +348,7 @@ class Store:
             # Do not let an older provider/cache response reopen or reset an episode.
             if old and observed < old["observed_at"]:
                 return None
-            low = report.remaining < threshold
+            low = report.effective_remaining < threshold
             episode = old["episode"] if old else 0
             if low and (not old or not old["low"]):
                 episode += 1

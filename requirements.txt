@@ -4,3 +4,4 @@ pybase16384>=0.3.9,<0.4
 aiosqlite>=0.21,<1
 APScheduler>=3.11,<4
 tzdata>=2025.1
+xlrd>=2.0.1,<3

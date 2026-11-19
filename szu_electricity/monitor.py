@@ -21,7 +21,7 @@ class CheckSummary:
         summary = (
             f"手动预警检查完成：检查 {self.checked_dorms} 间宿舍，"
             f"其中 {self.low_dorms} 间低于阈值；已发送 {self.sent_messages} 条预警。\n"
-            f"查询失败 {self.query_failures} 间，读数过期或缺失 {self.stale_dorms} 间，"
+            f"查询失败 {self.query_failures} 间，余额缺失 {self.stale_dorms} 间，"
             f"发送失败 {self.send_failures} 条。定时安排及自动预警记录未变更。"
         )
         if self.send_errors:
@@ -103,8 +103,8 @@ class Monitor:
     async def _check(self, bindings: list[Binding], *, manual: bool) -> CheckSummary:
         result = CheckSummary(checked_dorms=1)
         try:
-            report = await self.service.query(bindings[0].location)
-            if report.expired or report.remaining is None or report.observed_at is None:
+            report = await self.service.query(bindings[0].location, threshold=self.threshold)
+            if report.effective_remaining is None or report.observed_at is None:
                 self.logger.warning(
                     "跳过不可用余额 source=%s reason=%s observed_at=%s",
                     report.source,
@@ -113,11 +113,15 @@ class Monitor:
                 )
                 result.stale_dorms = 1
                 return result
-            result.low_dorms = int(report.remaining < self.threshold)
+            # Expired readings no longer skip the scan: the effective balance
+            # projects over the whole gap, so it still judges low power.
+            result.low_dorms = int(report.effective_remaining < self.threshold)
             self.logger.debug(
-                "低电量判定 source=%s below_threshold=%s observed_at=%s",
+                "低电量判定 source=%s below_threshold=%s effective=%s expired=%s observed_at=%s",
                 report.source,
                 bool(result.low_dorms),
+                report.effective_remaining,
+                report.expired,
                 report.observed_at,
             )
             if manual:

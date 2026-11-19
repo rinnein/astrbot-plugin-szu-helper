@@ -1,10 +1,16 @@
 import asyncio
 import logging
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, time, timedelta
 
 from szu_electricity.analytics import summarize
-from szu_electricity.models import CACHE_TTL_SECONDS, SHANGHAI, ProviderResult, Window
+from szu_electricity.models import (
+    DEFAULT_LOW_POWER_THRESHOLD,
+    SHANGHAI,
+    ProviderResult,
+    Reading,
+    Window,
+)
 from szu_electricity.monitor import Monitor
 from szu_electricity.service import ElectricityService
 
@@ -16,37 +22,67 @@ class Clock:
     def __call__(self):
         return self.now
 
-    def advance(self, seconds=CACHE_TTL_SECONDS):
-        self.now += seconds
+    def advance(self, seconds=None):
+        """Default advance crosses into the next day past the publication
+        window, so stored days stop being fresh and a refetch happens."""
+        if seconds is None:
+            local = datetime.fromtimestamp(self.now, SHANGHAI)
+            nxt = (local + timedelta(days=1)).replace(hour=0, minute=11, second=0, microsecond=0)
+            self.now = nxt.timestamp()
+        else:
+            self.now += seconds
+
+
+def patched_time(monkeypatch, clock) -> None:
+    """Tie service-side calendar days to the fake clock."""
+    from szu_electricity import service as service_module
+
+    monkeypatch.setattr(
+        service_module,
+        "local_now",
+        lambda: datetime.fromtimestamp(clock(), SHANGHAI),
+    )
 
 
 class Provider:
     name = "official"
 
-    def __init__(self):
+    def __init__(self, clock=None):
         self.calls = 0
         self.remaining = 4
         self.expired = False
         self.before = None
+        # Portal readings follow the fake clock so the elapsed-usage
+        # correction ages them by zero days.
+        self.clock = clock
 
     async def query(self, location, window):
         self.calls += 1
         if self.before:
             await self.before()
-        return ProviderResult(
-            [],
-            self.remaining,
-            datetime.now(SHANGHAI).replace(year=2020) if self.expired else datetime.now(SHANGHAI),
+        observed = (
+            datetime.fromtimestamp(self.clock(), SHANGHAI) if self.clock else datetime.now(SHANGHAI)
         )
+        if self.expired:
+            observed = observed.replace(year=2020)
+        rows = [
+            Reading(
+                datetime.combine(window.begin + timedelta(days=i), time.min, tzinfo=SHANGHAI),
+                daily=2,
+            )
+            for i in range(window.days)
+        ]
+        return ProviderResult(rows, self.remaining, observed)
 
 
 async def bind(store, location, user="1", origin="group1"):
     await store.bind("bot", origin, user, "User" + user, True, "aiocqhttp", location)
 
 
-async def test_coalesce_episodes_restart_new_binding(store, location):
-    provider = Provider()
+async def test_coalesce_episodes_restart_new_binding(monkeypatch, store, location):
     clock = Clock()
+    provider = Provider(clock)
+    patched_time(monkeypatch, clock)
     service = ElectricityService(provider, store, clock=clock)
     await bind(store, location)
     await bind(store, location, "2")
@@ -81,9 +117,10 @@ async def test_coalesce_episodes_restart_new_binding(store, location):
     assert store.path == path
 
 
-async def test_failure_stale_and_binding_race(store, location):
-    provider = Provider()
+async def test_failure_stale_and_binding_race(monkeypatch, store, location):
     clock = Clock()
+    provider = Provider(clock)
+    patched_time(monkeypatch, clock)
     service = ElectricityService(provider, store, clock=clock)
     await bind(store, location)
     calls = []
@@ -96,19 +133,36 @@ async def test_failure_stale_and_binding_race(store, location):
     await monitor.run()
     await monitor.run()
     assert len(calls) == 2  # failed sends were not recorded
+
+    # A dorm without any balance snapshot cannot judge low power at all;
+    # stale readings still warn through the projected effective balance.
     clock.advance()
-    provider.expired = True
+    await store.unbind("bot", "group1", "1")
+    await store.unbind("bot", "group1", "2")
+    await bind(store, replace(location, roomName="0901"), "9", "group9")
+    provider.remaining = None
     await monitor.run()
-    assert len(calls) == 2
-    clock.advance()
-    provider.expired = False
+    assert len(calls) == 2  # the balance-less dorm was queried and skipped
 
     async def unbind():
-        await store.unbind("bot", "group1", "1")
+        await store.unbind("bot", "group9", "9")
 
     provider.before = unbind
     await monitor.run()
+    # The binding vanished mid-query; the scan delivers to nobody.
     assert len(calls) == 2
+
+    # A live balance on the original dorm still triggers the race delivery.
+    await bind(store, location, "5", "group5")
+    provider.remaining = 4
+
+    async def unbind_during_query():
+        await store.unbind("bot", "group5", "5")
+
+    provider.before = unbind_during_query
+    clock.advance()
+    await monitor.run()
+    assert len(calls) == 2  # delivery found no pending binding
 
 
 async def test_cross_session_identity_and_older_data(store, location):
@@ -126,8 +180,8 @@ async def test_cross_session_identity_and_older_data(store, location):
 
 
 async def test_singleflight_cancellation_and_limit(store, location):
-    provider = Provider()
     clock = Clock()
+    provider = Provider(clock)
     service = ElectricityService(provider, store, clock=clock)
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -155,14 +209,17 @@ async def test_singleflight_cancellation_and_limit(store, location):
         active -= 1
 
     provider.before = concurrent
-    await asyncio.gather(*(service.query(replace(location, roomName=str(n))) for n in range(10)))
+    await asyncio.gather(
+        *(service.query(replace(location, roomName=f"{n:03d}")) for n in range(10))
+    )
     assert peak == 3
     await service.close()
 
 
-async def test_custom_threshold_boundary_and_changes(store, location):
-    provider = Provider()
+async def test_custom_threshold_boundary_and_changes(monkeypatch, store, location):
     clock = Clock()
+    provider = Provider(clock)
+    patched_time(monkeypatch, clock)
     service = ElectricityService(provider, store, clock=clock)
     await bind(store, location)
     sent = []
@@ -212,9 +269,10 @@ async def automatic_records(store):
     )
 
 
-async def test_manual_ignores_and_preserves_automatic_records(store, location):
-    provider = Provider()
+async def test_manual_ignores_and_preserves_automatic_records(monkeypatch, store, location):
     clock = Clock()
+    provider = Provider(clock)
+    patched_time(monkeypatch, clock)
     service = ElectricityService(provider, store, clock=clock)
     for sender, origin in [("1", "group1"), ("2", "group1"), ("3", "group2")]:
         await bind(store, location, sender, origin)
@@ -246,9 +304,10 @@ async def test_manual_ignores_and_preserves_automatic_records(store, location):
     await service.close()
 
 
-async def test_manual_does_not_consume_first_scheduled_warning(store, location):
-    provider = Provider()
+async def test_manual_does_not_consume_first_scheduled_warning(monkeypatch, store, location):
     clock = Clock()
+    provider = Provider(clock)
+    patched_time(monkeypatch, clock)
     service = ElectricityService(provider, store, clock=clock)
     await bind(store, location)
     sent = []
@@ -266,9 +325,10 @@ async def test_manual_does_not_consume_first_scheduled_warning(store, location):
     await service.close()
 
 
-async def test_manual_failures_stale_and_unbind(store, location):
-    provider = Provider()
+async def test_manual_failures_stale_and_unbind(monkeypatch, store, location):
     clock = Clock()
+    provider = Provider(clock)
+    patched_time(monkeypatch, clock)
     service = ElectricityService(provider, store, clock=clock)
     await bind(store, location)
     await bind(store, location, "2", "group2")
@@ -279,23 +339,27 @@ async def test_manual_failures_stale_and_unbind(store, location):
     monitor = Monitor(store, service, send, logging.getLogger())
     result = await monitor.run_manual()
     assert result.sent_messages == result.send_failures == 1
+    # A dorm whose balance is missing entirely cannot judge low power: bind a
+    # fresh room and drop the old ones so only the balance-less dorm remains.
     clock.advance()
-    provider.expired = True
+    await store.unbind("bot", "group1", "1")
+    await store.unbind("bot", "group2", "2")
+    await bind(store, replace(location, roomName="0901"), "3", "group3")
+    provider.remaining = None
     result = await monitor.run_manual()
     assert result.stale_dorms == 1 and result.sent_messages == 0
-    clock.advance()
-    provider.expired = False
 
     async def fail_query():
         raise RuntimeError("temporary failure")
 
+    # With no history at all a failed fetch counts as a query failure.
     provider.before = fail_query
+    await bind(store, replace(location, roomName="0802"), "4", "group4")
     result = await monitor.run_manual()
     assert result.query_failures == 1 and result.sent_messages == 0
 
     async def remove_bindings():
-        await store.unbind("bot", "group1", "1")
-        await store.unbind("bot", "group2", "2")
+        await store.unbind("bot", "group3", "3")
 
     provider.before = remove_bindings
     result = await monitor.run_manual()
@@ -304,13 +368,14 @@ async def test_manual_failures_stale_and_unbind(store, location):
     await service.close()
 
 
-async def test_manual_and_scheduled_runs_are_independent(store, location):
+async def test_manual_and_scheduled_runs_are_independent(monkeypatch, store, location):
     import pytest
 
     from szu_electricity.models import ElectricityError
 
-    provider = Provider()
     clock = Clock()
+    provider = Provider(clock)
+    patched_time(monkeypatch, clock)
     service = ElectricityService(provider, store, clock=clock)
     await bind(store, location)
     entered, release = asyncio.Event(), asyncio.Event()
@@ -331,12 +396,12 @@ async def test_manual_and_scheduled_runs_are_independent(store, location):
     query_count = 0
     query = service.query
 
-    async def tracked_query(location, detail=False):
+    async def tracked_query(location, detail=False, threshold=DEFAULT_LOW_POWER_THRESHOLD):
         nonlocal query_count
         query_count += 1
         if query_count == 2:
             joined.set()
-        return await query(location, detail)
+        return await query(location, detail, threshold)
 
     service.query = tracked_query
     manual = asyncio.create_task(monitor.run_manual())
@@ -386,7 +451,7 @@ async def test_valid_balance_can_alert_without_a_prediction(store, location):
         location, "iotun", Window.for_days(3, now.date()), ProviderResult([], 88, observed), now=now
     )
 
-    async def query(_):
+    async def query(_, *args, **kwargs):
         return report
 
     service = SimpleNamespace(query=query)

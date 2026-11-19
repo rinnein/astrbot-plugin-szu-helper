@@ -8,6 +8,7 @@ from szu_electricity.catalog import SFTEST_TO_SIMS, iotun_catalog, iotun_target
 from szu_electricity.config import Settings
 from szu_electricity.conversation import Selection
 from szu_electricity.models import (
+    DEFAULT_LOW_POWER_THRESHOLD,
     SHANGHAI,
     ElectricityError,
     Location,
@@ -108,9 +109,11 @@ def test_windows_and_stats(location):
     data = ProviderResult([Reading(at(1), 8, 10), Reading(at(2), 6, 12), Reading(at(3), 4, 14)])
     short = summarize(location, "official", Window.for_days(3, date(2026, 10, 3)), data)
     long = summarize(location, "official", window, data)
-    assert short.estimated_days == long.estimated_days == 2
+    # The end-of-day clock ages the 23:59-anchored balance by one minute of usage.
+    assert short.estimated_days == pytest.approx(2, abs=1e-2)
+    assert long.estimated_days == pytest.approx(2, abs=1e-2)
     assert short.daily_average == 2 and short.valid_days == 2
-    assert "2.44 元" in render(short)
+    assert "2.80 元" in render(short)
     assert "有效用量" in render(long, True)
 
 
@@ -126,7 +129,11 @@ def test_gaps_resets_duplicate_stale_and_zero(location):
     ]
     r = summarize(location, "official", window, ProviderResult(rows))
     assert r.valid_days == 2 and r.total_used == 3
-    assert r.estimated_days is None
+    # The 10-02→10-04 delta covers two days and is spread over both; meter
+    # resets and zero deltas never invent usage, but the covered-day average
+    # still supports an estimate instead of silencing it.
+    assert r.prediction_average == 1.0
+    assert r.estimated_days == pytest.approx(4.0, abs=1e-2)
     r = summarize(location, "official", window, ProviderResult(rows[:2]))
     assert r.expired and "过期" in render(r)
     r = summarize(location, "iotun", window, ProviderResult([Reading(at(6), daily=3)], 0, at(6)))
@@ -208,7 +215,8 @@ def test_reuse_options_paginate_without_accepting_ambiguous_yes(location):
 
 def test_midnight_does_not_expire_a_24_hour_old_balance(location):
     now = datetime(2026, 10, 3, 0, 15, tzinfo=SHANGHAI)
-    observed = datetime(2026, 10, 1, 23, 59, tzinfo=SHANGHAI)
+    # Yesterday's 23:59 snapshot stays fresh across midnight (calendar-day rule).
+    observed = datetime(2026, 10, 2, 23, 59, tzinfo=SHANGHAI)
     data = ProviderResult([Reading(observed, remaining=88, cumulative=100)])
     report = summarize(location, "iotun", Window.for_days(3, now.date()), data, now=now)
     assert not report.expired and report.unavailable_reason is None
@@ -217,10 +225,10 @@ def test_midnight_does_not_expire_a_24_hour_old_balance(location):
     assert "已过期" not in render(report)
 
 
-@pytest.mark.parametrize("age,expired", [(48 * 3600, False), (48 * 3600 + 1, True), (-1, True)])
-def test_balance_freshness_has_elapsed_time_boundary(location, age, expired):
+@pytest.mark.parametrize("days_ago,expired", [(1, False), (2, True), (-1, True)])
+def test_balance_freshness_follows_calendar_days(location, days_ago, expired):
     now = datetime(2026, 10, 3, 12, tzinfo=SHANGHAI)
-    observed = now - timedelta(seconds=age)
+    observed = now - timedelta(days=days_ago)
     report = summarize(
         location,
         "official",
@@ -229,10 +237,6 @@ def test_balance_freshness_has_elapsed_time_boundary(location, age, expired):
         now=now,
     )
     assert report.expired is expired
-    if age < 0:
-        assert report.unavailable_reason == "future_timestamp"
-    elif expired:
-        assert report.unavailable_reason == "stale"
 
 
 def test_missing_summary_timestamp_uses_only_matching_measured_balance(location):
@@ -256,3 +260,144 @@ def test_missing_summary_timestamp_uses_only_matching_measured_balance(location)
     assert (
         summarize(location, "iotun", window, data, now=now).unavailable_reason == "missing_balance"
     )
+
+
+def day(text):
+    return date.fromisoformat(text)
+
+
+def at_time(text):
+    return datetime.fromisoformat(text).replace(tzinfo=SHANGHAI)
+
+
+def test_multiday_deltas_spread_over_coverage_and_clip_to_the_window(location):
+    from szu_electricity.analytics import estimate, normalize
+
+    # 25 days at 1 kWh, then 5 days at 3 kWh: the 15 kWh delta covers 5 days.
+    rows = normalize(
+        [
+            Reading(at_time("2025-12-06 00:00"), cumulative=0),
+            Reading(at_time("2025-12-31 00:00"), cumulative=25),
+            Reading(at_time("2026-01-05 00:00"), cumulative=40),
+        ]
+    )
+    weekly, monthly, blended = estimate(rows, day("2026-01-05"))
+    assert weekly == pytest.approx(17 / 7)
+    assert monthly == pytest.approx(40 / 30)
+    assert blended == pytest.approx((17 / 7 + 40 / 30) / 2)
+
+
+def test_baseline_outside_window_counts_only_its_overlap(location):
+    from szu_electricity.analytics import normalize, window_average
+
+    rows = normalize(
+        [
+            Reading(at_time("2025-12-20 00:00"), cumulative=0),
+            Reading(at_time("2026-01-05 00:00"), cumulative=30),
+        ]
+    )
+    average, covered = window_average(rows, day("2026-01-05"), 7)
+    assert covered == 7.0
+    assert average == pytest.approx(30 / 16)
+
+
+def test_recharges_after_the_reading_use_end_of_day_semantics(location):
+    from szu_electricity.analytics import credits_after, evaluate_balance, recharge_kwh
+    from szu_electricity.models import Recharge
+
+    observed = at_time("2026-01-04 23:59:01")
+    credits = credits_after(
+        [
+            Recharge("2026-01-03 10:00:00", kwh=99),
+            # Date-only rows are end-of-day data: the same day is already
+            # inside that day's snapshot, a later day is credited.
+            Recharge("2026-01-04", kwh=5),
+            Recharge("2026-01-05 07:00:00", kwh=20),
+        ],
+        observed,
+    )
+    assert credits == pytest.approx(20.0)
+    # Missing kWh falls back to the fixed tariff.
+    assert recharge_kwh(Recharge("2026-01-05", yuan=69.979)) == pytest.approx(100.0)
+    state = evaluate_balance(10.0, credits, 4.0, observed, at_time("2026-01-05 11:59:01"))
+    assert state.elapsed_used == pytest.approx(2.0)
+    assert state.effective_remaining == pytest.approx(28.0)
+    assert state.estimated_days_left == pytest.approx(7.0)
+
+
+def test_stale_readings_project_over_the_whole_gap_and_allow_overdraft(location):
+    from szu_electricity.analytics import evaluate_balance
+
+    state = evaluate_balance(
+        100.0, 0.0, 4.0, at_time("2026-01-01 00:00:00"), at_time("2026-01-05 00:00:00")
+    )
+    # 四天的缺口按实际经过时间扣减，而不是只扣一天。
+    assert state.elapsed_used == pytest.approx(16.0)
+    assert state.effective_remaining == pytest.approx(84.0)
+    assert state.estimated_days_left == pytest.approx(21.0)
+    overdraft = evaluate_balance(
+        10.0, 0.0, 4.0, at_time("2026-01-01 00:00:00"), at_time("2026-01-05 00:00:00")
+    )
+    assert overdraft.effective_remaining == pytest.approx(-6.0)
+    assert overdraft.estimated_days_left == 0.0
+
+
+def test_warning_reasons_follow_the_effective_balance(location):
+    from szu_electricity.analytics import summarize
+    from szu_electricity.models import Recharge
+
+    window = Window.for_days(31, date(2026, 1, 5))
+    rows = [
+        Reading(at_time("2026-01-01 00:00"), cumulative=0),
+        Reading(at_time("2026-01-02 00:00"), cumulative=1),
+        Reading(at_time("2026-01-03 00:00"), cumulative=2),
+        Reading(at_time("2026-01-04 00:00"), cumulative=12),
+    ]
+
+    def run(
+        remaining, recharges=(), threshold=DEFAULT_LOW_POWER_THRESHOLD, observed="2026-01-05 08:00"
+    ):
+        return summarize(
+            location,
+            "official",
+            window,
+            ProviderResult(rows, remaining, at_time(observed)),
+            recharges,
+            threshold=threshold,
+            now=at_time("2026-01-05 08:00"),
+        )
+
+    healthy = run(9.0)
+    assert healthy.weekly_average == 4.0 and healthy.prediction_average == 4.0
+    assert healthy.estimated_days > 2.0 and healthy.warning_reason is None
+    assert "低于 5 度" in run(4.99).warning_reason
+    assert "低于 7.5 度" in run(7.4, threshold=7.5).warning_reason
+    overdraft = run(-2.0)
+    assert "透支 2.0 度" in overdraft.warning_reason
+    assert overdraft.estimated_days == 0.0
+    # A recharge after the reading lifts the balance out of the warning band.
+    assert run(1.0, [Recharge("2026-01-05 09:00:00", kwh=50)]).warning_reason is None
+    # Stale observations never silence the warning; expiry is a display note.
+    stale = run(1.0, observed="2026-01-01 00:00:00")
+    assert stale.expired and "透支" in stale.warning_reason
+    assert stale.estimated_days is not None
+    # 不足 1 天：日均远大于余额。
+    fast_burn = summarize(
+        location,
+        "official",
+        window,
+        ProviderResult(
+            [
+                Reading(at_time("2026-01-04 00:00"), cumulative=0),
+                Reading(at_time("2026-01-05 00:00"), cumulative=30),
+            ],
+            2.0,
+            at_time("2026-01-05 08:00"),
+        ),
+        (),
+        threshold=5.0,
+        now=at_time("2026-01-05 08:00"),
+    )
+    assert fast_burn.prediction_average == 30.0
+    # 有效余额 2.0 度先触发低电量分支；「不足 1 天」在余额不低但天数不足时出现。
+    assert "低于 5 度" in fast_burn.warning_reason

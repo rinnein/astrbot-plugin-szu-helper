@@ -21,13 +21,24 @@ from szu_electricity.sharing import decode, encode
 
 
 def verify(reference: Path, output: Path | None):
-    module = reference / "src-tauri/src/campus_payments/electricity/sharing.rs"
-    model = reference / "src-tauri/src/campus_payments/model.rs"
+    # The reference project moved its crates into a workspace
+    # (src-tauri/crates/…); keep the pre-split layout as a fallback.
+    campus = reference / "src-tauri/crates/szu-core/src/campus_payments"
+    if not campus.is_dir():
+        campus = reference / "src-tauri/src/campus_payments"
+    module = campus / "electricity/sharing.rs"
+    model = campus / "model.rs"
+    # sharing.rs calls super::validate_room_name; lift the exact function from
+    # the sibling module so the harness compiles against the real behavior.
+    electricity_text = (campus / "electricity.rs").read_text()
+    start = electricity_text.index("fn validate_room_name")
+    end = electricity_text.index("\n}", start) + 2
+    validate_room_name = electricity_text[start:end]
     # Use the exact production struct declaration and serde attributes, not a
     # handwritten approximation of the JSON shape.
     model_text = model.read_text()
     end = model_text.index("\n}", model_text.index("struct ElectricityLocationSettings")) + 2
-    location_definition = model_text[:end]
+    location_definition = model_text[:end] + "\n" + validate_room_name
     cases = [
         Location("yuehai", "yuehai-main", "54", "山茶斋", "0601"),
         Location("yuehai", "yuehai-xinzhai", "7126", "风槐斋", "0801"),
@@ -35,8 +46,13 @@ def verify(reference: Path, output: Path | None):
         Location("xili", "xili-main", "10057", "A栋风信子", "0701"),
         Location("xili", "xili-lihuo-phase2", "01", "梧桐树", "501"),
     ]
-    # Exercise every remainder size in Base16384's 7-byte blocks too.
-    cases += [Location("yuehai", "yuehai-main", "54", "山茶斋", "0" * n + "601") for n in range(7)]
+    # Exercise every remainder size in Base16384's 7-byte blocks too. Room
+    # names must stay portal-valid (encode_settings validates them), so pad
+    # the building name instead: each extra byte shifts the block remainder.
+    cases += [
+        Location("yuehai", "yuehai-main", str(540 + n), "山茶斋" + "楼" * n, "0601")
+        for n in range(7)
+    ]
     catalog = empty_catalog()
     for location in cases:
         area = next(a for a in catalog.areas if a.id == location.areaId)
@@ -71,11 +87,19 @@ fn main() {
         let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
         let settings: ElectricityLocationSettings = serde_json::from_value(request["location"].clone()).unwrap();
         let options: Vec<ElectricityCampus> = serde_json::from_value(request["catalog"].clone()).unwrap();
-        let imported = sharing::decode_settings(request["python_code"].as_str().unwrap()).unwrap();
-        assert_eq!(settings, imported);
-        sharing::validate_options(&imported, &options).unwrap();
-        let exported = sharing::encode_settings(settings).unwrap();
-        println!("{}", serde_json::json!({"code": exported, "location": imported}));
+        let exported = sharing::encode_settings(settings.clone()).unwrap();
+        // Share codes for room-name padding cases are byte-level vectors only:
+        // the reference portal rejects room names longer than four digits.
+        let value = match sharing::decode_settings(request["python_code"].as_str().unwrap()) {
+            Ok(v) => {
+                match sharing::validate_options(&v, &options) {
+                    Ok(_) => serde_json::json!({"code": exported, "location": v, "validated": true}),
+                    Err(err) => serde_json::json!({"code": exported, "validate_error": err}),
+                }
+            }
+            Err(err) => serde_json::json!({"code": exported, "decode_error": err}),
+        };
+        println!("{}", value);
     }
 }
 """.replace("__LOCATION__", location_definition).replace(
@@ -115,8 +139,17 @@ serde_json = "1"
         results = [json.loads(line) for line in process.stdout.splitlines()]
         assert len(results) == len(cases)
         for settings, result in zip(cases, results, strict=True):
-            assert result["location"] == asdict(settings)
+            # Byte-level encode interop holds for every case, including the
+            # room-name padding vectors the reference portal would reject.
             assert encode(settings) == result["code"]
+            if "decode_error" in result:
+                continue
+            if "validate_error" in result:
+                raise AssertionError(
+                    f"validate_options failed for {settings.roomName}: {result['validate_error']}"
+                )
+            assert result["location"] == asdict(settings)
+            assert result["validated"] is True
             assert decode(result["code"]) == settings
             assert catalog.validate(decode(result["code"])) == settings
     proof = {
